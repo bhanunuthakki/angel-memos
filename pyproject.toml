@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "angel-memos"
+version = "0.1.0"
+description = "Adversarial bull/bear investment-memo generator for angel deals"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.7",
+    "pypdf>=4.2",
+    "pypdfium2>=4.30",  # PDF -> PNG rasterization (avoids Poppler dep)
+    "pillow>=10",       # required by pypdfium2's PIL bridge
+    "openpyxl>=3.1",
+    "click>=8.1",
+    "google-api-python-client>=2.130",
+    "google-auth-oauthlib>=1.2",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+    "pyright>=1.1.380",
+    # 1.39.9 ignores [tool.basedpyright] in pyproject.toml (scans outside
+    # `include`, drops rule overrides); 1.39.4 is the last verified-good.
+    "basedpyright==1.39.4",
+]
+
+[project.scripts]
+angel-memos = "angel_memos.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["angel_memos*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = [".venv", ".tmp", ".cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "RET", "SIM", "RUF"]
+ignore = [
+    "E501",   # handled by formatter
+    "RUF002", # ambiguous unicode in docstrings — × is fine
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B", "N802"]
+
+# Type-checker config (pyright AND basedpyright) lives in pyrightconfig.json —
+# basedpyright does not reliably read pyproject tool sections in this
+# workspace, and pyrightconfig.json takes precedence for both tools.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Integration tests hit real Claude (slow, costs subscription quota); opt in
+# explicitly via `pytest -m integration` or `pytest -m "integration or not integration"`.
+addopts = "-ra --strict-markers -m 'not integration'"
+pythonpath = ["src"]
+markers = [
+    "integration: real-Claude or real-Google-Docs tests (slow; skipped by default)",
+]

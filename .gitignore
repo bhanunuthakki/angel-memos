@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.tmp/
+.cache/
+*.token.json
+google-token.json
+credentials.json
+.env
+.env.*
+!.env.example
+
+# Sensitive/personal fixtures — drop your own copies locally; never commit.
+tests/fixtures/*.pdf
+tests/fixtures/*.xlsx

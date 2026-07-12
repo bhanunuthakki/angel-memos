@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Angel Memos Capture",
+  "version": "0.1.0",
+  "description": "One-click capture of an AngelList deal page + attachments into Downloads/angel-memos/<Company>/ for the angel-memos watcher.",
+  "permissions": ["downloads", "debugger", "activeTab"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.angellist.com/*", "https://*.angel.co/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
