@@ -12,7 +12,9 @@ A drop is ready iff `job.json` exists and no in-flight download artifacts
 
 from __future__ import annotations
 
+import contextlib
 import shutil
+import zipfile
 from pathlib import Path
 from typing import Literal
 
@@ -84,6 +86,13 @@ def ingest_folder(drop: Path, cfg: Config) -> IngestResult:
     for src in sorted(drop.iterdir()):
         if not src.is_file() or src.name == JOB_FILENAME:
             continue
+        # "Download all" from an AngelList dataroom arrives as a single zip;
+        # unpack it so the individual deck/docs land in the company folder
+        # where load_materials can classify them.
+        if src.suffix.lower() == ".zip":
+            moved.extend(_extract_zip(src, dest))
+            src.unlink()
+            continue
         target = _collision_free(dest / src.name)
         shutil.move(str(src), str(target))
         moved.append(target.name)
@@ -100,6 +109,28 @@ def run_ingest(inbox: Path, cfg: Config) -> list[IngestResult]:
     return [ingest_folder(drop, cfg) for drop in scan_inbox(inbox)]
 
 
+def _extract_zip(archive: Path, dest: Path) -> list[str]:
+    """Flatten a zip's file members into `dest` (collision-free), skipping
+    directories and archive cruft (`__MACOSX/`, dotfiles). Returns the names
+    written. A corrupt zip is skipped with no members extracted."""
+    written: list[str] = []
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                name = Path(info.filename).name
+                if not name or name.startswith(".") or "__MACOSX" in info.filename:
+                    continue
+                target = _collision_free(dest / name)
+                with zf.open(info) as member, target.open("wb") as out:
+                    shutil.copyfileobj(member, out)
+                written.append(target.name)
+    except zipfile.BadZipFile:
+        return written
+    return written
+
+
 def _collision_free(target: Path) -> Path:
     if not target.exists():
         return target
@@ -112,5 +143,13 @@ def _collision_free(target: Path) -> Path:
 
 
 def _remove_if_empty(folder: Path) -> None:
+    """Best-effort cleanup of the consumed drop dir.
+
+    On Windows the now-empty directory can be transiently locked (Drive
+    sync, the search indexer, or the browser's download manager still
+    holding a handle), so a failed rmdir must be non-fatal — otherwise one
+    locked dir aborts the whole ingest batch. An empty leftover is harmless:
+    job.json is already gone, so scan_inbox won't re-ingest it."""
     if folder.is_dir() and not any(folder.iterdir()):
-        folder.rmdir()
+        with contextlib.suppress(OSError):
+            folder.rmdir()

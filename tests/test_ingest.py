@@ -2,7 +2,10 @@
 moves into the Evaluation folder, and collision handling. No Claude calls."""
 
 import json
+import zipfile
 from pathlib import Path
+
+import pytest
 
 from angel_memos.config import Config
 from angel_memos.ingest import (
@@ -140,6 +143,87 @@ def test_ingest_does_not_move_job_file(tmp_path: Path) -> None:
     drop = _make_drop(tmp_path / "inbox")
     result = ingest_folder(drop, cfg)
     assert not (result.folder / JOB_FILENAME).exists()
+
+
+def test_ingest_tolerates_unremovable_drop_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A locked (unremovable) drop dir must not abort the ingest — the files
+    are already moved by then; only the empty-dir cleanup fails."""
+    cfg = _cfg(tmp_path)
+    drop = _make_drop(tmp_path / "inbox")
+
+    def boom(self: Path) -> None:
+        raise PermissionError("[WinError 5] Access is denied")
+
+    monkeypatch.setattr(Path, "rmdir", boom)
+    result = ingest_folder(drop, cfg)  # must NOT raise
+    dest = cfg.evaluation_root / "Acme"
+    assert (dest / "angellist - Acme.pdf").is_file()
+    assert result.job.company == "Acme"
+
+
+def _make_zip(path: Path, members: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+
+
+def test_ingest_unpacks_download_all_zip(tmp_path: Path) -> None:
+    """A dataroom 'Download all' zip is unpacked so the deck + docs land loose
+    in the company folder (and the zip itself is not kept)."""
+    cfg = _cfg(tmp_path)
+    drop = (tmp_path / "inbox" / "Acme").resolve()
+    drop.mkdir(parents=True)
+    (drop / "angellist - Acme.pdf").write_bytes(b"%PDF page")
+    _make_zip(
+        drop / "documents.zip",
+        {"Acme Deck.pdf": b"%PDF deck", "Disclaimers.pdf": b"%PDF disc"},
+    )
+    (drop / JOB_FILENAME).write_text(json.dumps({"company": "Acme", "tier": "quick"}))
+
+    result = ingest_folder(drop, cfg)
+    dest = cfg.evaluation_root / "Acme"
+    assert (dest / "Acme Deck.pdf").read_bytes() == b"%PDF deck"
+    assert (dest / "Disclaimers.pdf").is_file()
+    assert not (dest / "documents.zip").exists()  # zip consumed, not kept
+    assert "Acme Deck.pdf" in result.moved
+
+
+def test_ingest_zip_flattens_nested_dirs_and_skips_cruft(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    drop = (tmp_path / "inbox" / "Acme").resolve()
+    drop.mkdir(parents=True)
+    (drop / "angellist - Acme.pdf").write_bytes(b"%PDF")
+    _make_zip(
+        drop / "all.zip",
+        {
+            "sub/Deck.pdf": b"deck",
+            "__MACOSX/._Deck.pdf": b"junk",
+            ".DS_Store": b"junk",
+        },
+    )
+    (drop / JOB_FILENAME).write_text(json.dumps({"company": "Acme", "tier": "none"}))
+
+    result = ingest_folder(drop, cfg)
+    dest = cfg.evaluation_root / "Acme"
+    assert (dest / "Deck.pdf").read_bytes() == b"deck"
+    assert not (dest / ".DS_Store").exists()
+    assert result.moved.count("Deck.pdf") == 1
+
+
+def test_ingest_corrupt_zip_is_skipped_not_fatal(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    drop = (tmp_path / "inbox" / "Acme").resolve()
+    drop.mkdir(parents=True)
+    (drop / "angellist - Acme.pdf").write_bytes(b"%PDF")
+    (drop / "broken.zip").write_bytes(b"not really a zip")
+    (drop / JOB_FILENAME).write_text(json.dumps({"company": "Acme", "tier": "none"}))
+
+    result = ingest_folder(drop, cfg)  # must not raise
+    dest = cfg.evaluation_root / "Acme"
+    assert (dest / "angellist - Acme.pdf").is_file()
+    assert result.missing_angellist is False
 
 
 def test_run_ingest_processes_all_ready_drops(tmp_path: Path) -> None:

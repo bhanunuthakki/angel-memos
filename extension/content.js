@@ -1,8 +1,12 @@
 // Angel Memos Capture — content script.
-// Injects a small floating panel on AngelList pages. On click it scrapes
-// the company name + attachment links and asks the background worker to
-// download everything into Downloads/angel-memos/<Company>/, writing
-// job.json last as the "drop is complete" marker for `angel-memos watch`.
+// Injects a small floating panel on AngelList pages. On click it captures
+// the deal into Downloads/angel-memos/<Company>/:
+//   1. arms the background download-router for this company,
+//   2. clicks the dataroom's document download buttons (the deck + docs are
+//      JS buttons with aria-label="Download"/"Download all", NOT <a href>
+//      links — so they must be clicked, not scraped),
+//   3. hands any real <a href> attachments to the background too,
+//   4. background prints the page to PDF and writes job.json LAST.
 
 (() => {
   if (document.getElementById("angel-memos-panel")) return;
@@ -36,27 +40,42 @@
     return btn;
   };
 
+  const setStatus = (msg) => { status.textContent = msg; };
+
   const capture = (tier) => {
     const company = guessCompanyName();
     const confirmed = window.prompt("Company folder name:", company);
     if (!confirmed) return;
-    status.textContent = "Capturing…";
+    setStatus("Arming…");
+    // Step 1: arm the background download-router BEFORE any page download
+    // can fire, so button-triggered downloads get routed into the folder.
     chrome.runtime.sendMessage(
-      {
-        kind: "angel-memos-capture",
-        company: confirmed.trim(),
-        tier,
-        sourceUrl: location.href,
-        attachments: collectAttachmentLinks(),
-      },
-      (reply) => {
-        if (chrome.runtime.lastError) {
-          status.textContent = "Error: " + chrome.runtime.lastError.message;
+      { kind: "am-arm", company: confirmed.trim(), tier, sourceUrl: location.href },
+      (ack) => {
+        if (chrome.runtime.lastError || !ack || !ack.ok) {
+          setStatus("Error arming: " + (chrome.runtime.lastError?.message || "no reply"));
           return;
         }
-        status.textContent = reply && reply.ok
-          ? `Saved ${reply.count} file(s) ✓`
-          : "Failed: " + (reply ? reply.error : "no reply");
+        // Step 2: click the dataroom document download buttons.
+        const clicked = clickDataroomDownloads();
+        // Step 3: also hand over any real anchor attachments.
+        const attachments = collectAttachmentLinks();
+        setStatus(clicked ? `Downloading ${clicked} doc(s)…` : "Capturing page…");
+        // Step 4: background prints the page + finalizes (job.json last).
+        chrome.runtime.sendMessage(
+          { kind: "am-run", attachments, docClicks: clicked },
+          (reply) => {
+            if (chrome.runtime.lastError) {
+              setStatus("Error: " + chrome.runtime.lastError.message);
+              return;
+            }
+            setStatus(
+              reply && reply.ok
+                ? `Saved ${reply.count} file(s) ✓`
+                : "Failed: " + (reply ? reply.error : "no reply")
+            );
+          }
+        );
       }
     );
   };
@@ -70,8 +89,6 @@
   document.documentElement.appendChild(panel);
 
   function guessCompanyName() {
-    // Deal pages usually lead with the company in the first h1; fall back
-    // to the document title's first segment.
     const h1 = document.querySelector("h1");
     if (h1 && h1.textContent.trim()) return cleanup(h1.textContent);
     return cleanup(document.title.split(/[|\-–—]/)[0]);
@@ -81,9 +98,26 @@
     return text.replace(/\s+/g, " ").trim().slice(0, 80);
   }
 
+  // AngelList datarooms expose each document (deck, closing docs, etc.) as a
+  // button with aria-label "Download" or "Download all" — no href. Prefer
+  // "Download all" (one click grabs the deck + everything, as a zip the
+  // watcher unpacks); otherwise click each per-document button. Returns the
+  // number of buttons clicked.
+  function clickDataroomDownloads() {
+    const all = document.querySelector('button[aria-label="Download all" i]');
+    if (all) {
+      all.click();
+      return 1;
+    }
+    const perDoc = [
+      ...document.querySelectorAll('button[aria-label="Download" i]'),
+    ];
+    for (const btn of perDoc) btn.click();
+    return perDoc.length;
+  }
+
+  // Real anchor attachments (for standard deal pages that DO use links).
   function collectAttachmentLinks() {
-    // Attachment/data-room links: same-page anchors to PDFs or AL's
-    // attachment endpoints. Deduplicated; signed S3 URLs pass through.
     const urls = new Set();
     for (const a of document.querySelectorAll("a[href]")) {
       const href = a.href;
@@ -92,7 +126,7 @@
       if (
         lower.includes(".pdf") ||
         lower.includes("/attachments/") ||
-        lower.includes("document") && lower.includes("download")
+        (lower.includes("document") && lower.includes("download"))
       ) {
         urls.add(href);
       }

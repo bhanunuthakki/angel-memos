@@ -10,10 +10,18 @@ On any AngelList page a small panel appears (bottom-right):
   the quick tier (diligence + scorecard) automatically.
 - **Save only** — capture without triggering research.
 
-Capture = print the deal page to PDF (`angellist - <Company>.pdf`),
-download every attachment link on the page, and write `job.json` **last**
-into `Downloads/angel-memos/<Company>/`. The watcher treats `job.json` as
-the "drop is complete" marker.
+Capture does three things into `Downloads/angel-memos/<Company>/`:
+1. prints the deal page to PDF (`angellist - <Company>.pdf`);
+2. grabs the dataroom documents (the **deck**, closing docs, etc.). These
+   are JS **buttons** (`aria-label="Download"` / `"Download all"`), *not*
+   links — so the extension clicks them and a background download-router
+   reroutes the resulting files into the company folder. "Download all"
+   arrives as a zip, which the watcher unpacks on ingest;
+3. writes `job.json` **last** — the watcher treats it as the "drop is
+   complete" marker, so it's only written after all downloads settle.
+
+Standard deal pages that expose real `<a href>` attachment links still work
+too — those are downloaded directly.
 
 ## Install (load unpacked)
 
