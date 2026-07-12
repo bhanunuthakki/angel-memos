@@ -1,18 +1,31 @@
 // Angel Memos Capture — content script.
-// Injects a small floating panel on AngelList pages. On click it captures
-// the deal into Downloads/angel-memos/<Company>/:
+// Injects a small floating panel on AngelList pages. On click it captures the
+// deal into Downloads/angel-memos/<Company>/:
 //   1. arms the background download-router for this company,
-//   2. clicks the dataroom's document download buttons (the deck + docs are
-//      JS buttons with aria-label="Download"/"Download all", NOT <a href>
-//      links — so they must be clicked, not scraped),
-//   3. hands any real <a href> attachments to the background too,
-//   4. background prints the page to PDF and writes job.json LAST.
+//   2. clicks the dataroom document download buttons (deck/docs are JS buttons
+//      with aria-label="Download"/"Download all", NOT <a href> links),
+//   3. if the deck is VIEW-ONLY (no download control), opens the deck viewer
+//      so the background can print it to PDF like the AL memo,
+//   4. hands any real <a href> attachments and embedded PDF viewer sources to
+//      the background too,
+//   5. background prints the deal page + any viewer tab, then writes job.json
+//      LAST as the drop-completeness marker.
 
 (() => {
   if (document.getElementById("angel-memos-panel")) return;
 
+  const PANEL_ID = "angel-memos-panel";
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const send = (msg) =>
+    new Promise((resolve) => {
+      chrome.runtime.sendMessage(msg, (reply) => {
+        if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+        else resolve(reply || { ok: false, error: "no reply" });
+      });
+    });
+
   const panel = document.createElement("div");
-  panel.id = "angel-memos-panel";
+  panel.id = PANEL_ID;
   panel.style.cssText = [
     "position:fixed", "bottom:18px", "right:18px", "z-index:2147483647",
     "background:#111827", "color:#f9fafb", "border-radius:8px",
@@ -27,6 +40,7 @@
 
   const status = document.createElement("div");
   status.style.cssText = "color:#9ca3af;min-height:14px";
+  const setStatus = (msg) => { status.textContent = msg; };
 
   const mkButton = (label, tier) => {
     const btn = document.createElement("button");
@@ -36,49 +50,39 @@
       "padding:6px 8px", "cursor:pointer", "font:inherit", "font-weight:600",
     ].join(";");
     if (tier === "none") btn.style.background = "#374151";
-    btn.addEventListener("click", () => capture(tier));
+    btn.addEventListener("click", () => { void capture(tier); });
     return btn;
   };
 
-  const setStatus = (msg) => { status.textContent = msg; };
-
-  const capture = (tier) => {
+  async function capture(tier) {
     const company = guessCompanyName();
     const confirmed = window.prompt("Company folder name:", company);
     if (!confirmed) return;
+
+    // Step 1: arm the router BEFORE any page download can fire.
     setStatus("Arming…");
-    // Step 1: arm the background download-router BEFORE any page download
-    // can fire, so button-triggered downloads get routed into the folder.
-    chrome.runtime.sendMessage(
-      { kind: "am-arm", company: confirmed.trim(), tier, sourceUrl: location.href },
-      (ack) => {
-        if (chrome.runtime.lastError || !ack || !ack.ok) {
-          setStatus("Error arming: " + (chrome.runtime.lastError?.message || "no reply"));
-          return;
-        }
-        // Step 2: click the dataroom document download buttons.
-        const clicked = clickDataroomDownloads();
-        // Step 3: also hand over any real anchor attachments.
-        const attachments = collectAttachmentLinks();
-        setStatus(clicked ? `Downloading ${clicked} doc(s)…` : "Capturing page…");
-        // Step 4: background prints the page + finalizes (job.json last).
-        chrome.runtime.sendMessage(
-          { kind: "am-run", attachments, docClicks: clicked },
-          (reply) => {
-            if (chrome.runtime.lastError) {
-              setStatus("Error: " + chrome.runtime.lastError.message);
-              return;
-            }
-            setStatus(
-              reply && reply.ok
-                ? `Saved ${reply.count} file(s) ✓`
-                : "Failed: " + (reply ? reply.error : "no reply")
-            );
-          }
-        );
-      }
-    );
-  };
+    const ack = await send({
+      kind: "am-arm", company: confirmed.trim(), tier, sourceUrl: location.href,
+    });
+    if (!ack.ok) { setStatus("Error arming: " + ack.error); return; }
+
+    // Step 2: click the dataroom document download buttons (deck + docs).
+    const clicked = clickDataroomDownloads();
+
+    // Step 3: if nothing obviously downloaded the deck, open the deck viewer
+    // so the background can print it to PDF (the view-only-deck case).
+    const deckOpened = openDeckViewer();
+
+    // Step 4: give the viewer a moment to open, then gather anchor links and
+    // any embedded PDF viewer sources.
+    setStatus(clicked ? `Downloading ${clicked} doc(s)…` : "Capturing…");
+    await sleep(deckOpened ? 1800 : 300);
+    const attachments = [...collectAttachmentLinks(), ...collectEmbeddedPdfSrcs()];
+
+    // Step 5: background prints the page (+ any viewer tab) and finalizes.
+    const reply = await send({ kind: "am-run", attachments, docClicks: clicked, deckOpened });
+    setStatus(reply.ok ? `Saved ${reply.count} file(s) ✓` : "Failed: " + reply.error);
+  }
 
   panel.append(
     title,
@@ -98,25 +102,46 @@
     return text.replace(/\s+/g, " ").trim().slice(0, 80);
   }
 
-  // AngelList datarooms expose each document (deck, closing docs, etc.) as a
-  // button with aria-label "Download" or "Download all" — no href. Prefer
-  // "Download all" (one click grabs the deck + everything, as a zip the
-  // watcher unpacks); otherwise click each per-document button. Returns the
-  // number of buttons clicked.
+  // Dataroom documents are download buttons (aria-label "Download"/"Download
+  // all"), no href. Prefer "Download all" (grabs the deck + everything as a
+  // zip the watcher unpacks); else click each per-document button. Returns
+  // the count clicked.
   function clickDataroomDownloads() {
     const all = document.querySelector('button[aria-label="Download all" i]');
     if (all) {
       all.click();
       return 1;
     }
-    const perDoc = [
-      ...document.querySelectorAll('button[aria-label="Download" i]'),
-    ];
+    const perDoc = [...document.querySelectorAll('button[aria-label="Download" i]')];
     for (const btn of perDoc) btn.click();
     return perDoc.length;
   }
 
-  // Real anchor attachments (for standard deal pages that DO use links).
+  // View-only decks have no download control — they open in a viewer (a new
+  // tab or an in-page embed). Click the deck control so the background can
+  // capture the resulting PDF. Returns whether a deck control was clicked.
+  function openDeckViewer() {
+    const inPanel = (el) => el.closest && el.closest("#" + PANEL_ID);
+    const looksLikeDeck = (el) => {
+      const label = (el.getAttribute("aria-label") || "") + " " + (el.textContent || "");
+      return /\bdeck\b|\bpitch deck\b|view deck/i.test(label);
+    };
+    const candidates = [
+      ...document.querySelectorAll('a, button, [role="button"]'),
+    ].filter((el) => !inPanel(el) && looksLikeDeck(el));
+    // Shortest label first — avoids clicking a big container that merely
+    // contains the word "deck".
+    candidates.sort(
+      (a, b) => (a.textContent || "").length - (b.textContent || "").length
+    );
+    if (candidates[0]) {
+      candidates[0].click();
+      return true;
+    }
+    return false;
+  }
+
+  // Real anchor attachments (standard deal pages that DO use links).
   function collectAttachmentLinks() {
     const urls = new Set();
     for (const a of document.querySelectorAll("a[href]")) {
@@ -129,6 +154,21 @@
         (lower.includes("document") && lower.includes("download"))
       ) {
         urls.add(href);
+      }
+    }
+    return [...urls];
+  }
+
+  // Embedded PDF viewers: an <iframe>/<embed>/<object> whose source is an
+  // https PDF/document URL. (blob: sources are context-scoped and can't be
+  // fetched by the background — those fall to the viewer-tab print path.)
+  function collectEmbeddedPdfSrcs() {
+    const urls = new Set();
+    for (const el of document.querySelectorAll("iframe[src], embed[src], object[data]")) {
+      const src = el.getAttribute("src") || el.getAttribute("data") || "";
+      if (!/^https?:/i.test(src)) continue;
+      if (/\.pdf(\?|$)/i.test(src) || /document|attachment|dataroom|file/i.test(src)) {
+        urls.add(src);
       }
     }
     return [...urls];

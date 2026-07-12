@@ -10,18 +10,32 @@ On any AngelList page a small panel appears (bottom-right):
   the quick tier (diligence + scorecard) automatically.
 - **Save only** — capture without triggering research.
 
-Capture does three things into `Downloads/angel-memos/<Company>/`:
+Capture writes into `Downloads/angel-memos/<Company>/`:
 1. prints the deal page to PDF (`angellist - <Company>.pdf`);
-2. grabs the dataroom documents (the **deck**, closing docs, etc.). These
-   are JS **buttons** (`aria-label="Download"` / `"Download all"`), *not*
-   links — so the extension clicks them and a background download-router
-   reroutes the resulting files into the company folder. "Download all"
-   arrives as a zip, which the watcher unpacks on ingest;
-3. writes `job.json` **last** — the watcher treats it as the "drop is
-   complete" marker, so it's only written after all downloads settle.
+2. grabs the dataroom documents (closing docs, disclaimers, and the **deck**
+   when it has a download control). These are JS **buttons**
+   (`aria-label="Download"` / `"Download all"`), *not* links — the extension
+   clicks them and a background download-router reroutes the resulting files
+   into the company folder. "Download all" arrives as a zip the watcher
+   unpacks on ingest;
+3. handles the **view-only deck** (the common case where the deck has no
+   download control): the extension clicks the deck open, and if it opens in
+   a new tab the background prints *that* tab to PDF — same mechanism as the
+   AL memo. Embedded PDF viewers (`<iframe>`/`<embed>` with an https source)
+   are captured by URL;
+4. writes `job.json` **last** — the watcher treats it as the "drop is
+   complete" marker, so it's only written after downloads + the deck viewer
+   settle.
 
 Standard deal pages that expose real `<a href>` attachment links still work
 too — those are downloaded directly.
+
+> **Deck capture is best-effort and needs a live test.** Datarooms vary in
+> how they expose the deck (download button, embedded viewer, new-tab
+> viewer, or a canvas/image renderer with no PDF URL at all — that last case
+> still can't be auto-captured). After reloading the extension, capture one
+> deal and confirm a deck PDF lands in the folder; if not, open the deck and
+> use the browser's own Print → Save as PDF into the company folder.
 
 ## Install (load unpacked)
 

@@ -1,31 +1,38 @@
 // Angel Memos Capture — background service worker.
 //
 // Capture flow (driven by content.js):
-//   am-arm  -> arm the download-router for a company (must happen BEFORE any
-//              page-initiated download fires) and return an ack.
-//   am-run  -> print the deal page to PDF, download any anchor attachments,
-//              then wait for the dataroom's button-triggered downloads to
-//              settle, and write job.json LAST as the completeness marker.
+//   am-arm  -> arm the download-router + viewer-tab watcher for a company
+//              (must happen BEFORE any page download / viewer tab opens) and
+//              return an ack.
+//   am-run  -> print the deal page to PDF, download anchor attachments +
+//              embedded PDF sources, wait for the dataroom's button-triggered
+//              downloads AND any deck-viewer tab to settle, then write job.json
+//              LAST as the completeness marker.
 //
-// Why a router: AngelList dataroom documents (the deck, closing docs, etc.)
-// download via JS buttons, not links. The page initiates those downloads
-// itself, so we can't set their path at call time — instead we catch them in
-// onDeterminingFilename and rewrite the path into angel-memos/<Company>/.
+// Three capture mechanisms, because datarooms expose documents three ways:
+//   - real <a href> links               -> downloaded directly
+//   - JS download buttons ("Download")  -> clicked by content, caught by the
+//                                          onDeterminingFilename router
+//   - VIEW-ONLY deck (no download)      -> content clicks it open; if it opens
+//                                          in a new tab we print that tab to
+//                                          PDF here, same as the AL memo.
 //
 // Chrome extensions can only write under ~/Downloads; the `angel-memos watch`
 // daemon then moves each completed drop into the Drive Evaluation folder.
 
 const ROOT = "angel-memos";
-const QUIET_MS = 3500; // no new download activity for this long => done
-const MIN_RUN_MS = 4000; // never finalize sooner than this after am-run
-const MAX_RUN_MS = 120000; // hard cap so a stuck download can't hang forever
+const QUIET_MS = 3500; // no new download/tab activity for this long => done
+const MIN_RUN_MS = 3000; // never finalize sooner than this after am-run
+const MAX_RUN_MS = 45000; // hard cap so a stuck download/tab can't hang forever
+const PRINT_TIMEOUT_MS = 15000; // debugger print must not hang the capture
 
 // In-memory capture state. A capture is a short burst, so keeping this in the
 // (possibly ephemeral) service worker for its duration is fine.
 let active = null;
 // active = {
-//   company, dir, startedAt, lastActivity, buttonsDone,
-//   pending:Set<number>, completed:number, finalize:Function|null
+//   company, dir, tier, sourceUrl, tabId,
+//   startedAt, lastActivity, buttonsDone,
+//   pending:Set<number>, viewerTabs:Set<number>, completed:number
 // }
 
 // --- Download router: registered once, synchronously, at top level. ---------
@@ -35,7 +42,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     suggest();
     return;
   }
-  // Our own downloads (page PDF, anchors, job.json) already carry a filename.
+  // Our own downloads (page/deck PDFs, anchors, job.json) already carry a path.
   if (item.byExtensionId === chrome.runtime.id) {
     suggest();
     return;
@@ -50,7 +57,6 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
 
 chrome.downloads.onCreated.addListener((item) => {
   if (!active) return;
-  // Track everything that starts during a capture (ours + rerouted page docs).
   active.pending.add(item.id);
   active.lastActivity = Date.now();
 });
@@ -64,12 +70,43 @@ chrome.downloads.onChanged.addListener((delta) => {
   }
 });
 
+// --- Deck-viewer tab watcher: a tab opened by the capture tab is the deck. --
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (!active || tab.openerTabId !== active.tabId || tab.id == null) return;
+  active.viewerTabs.add(tab.id);
+  active.lastActivity = Date.now();
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+  if (!active || !active.viewerTabs.has(tabId) || info.status !== "complete") return;
+  active.viewerTabs.delete(tabId);
+  active.lastActivity = Date.now();
+  try {
+    const b64 = await withTimeout(printPageToPdf(tabId), PRINT_TIMEOUT_MS, "deck print");
+    const name = deckFilename(tab && tab.title);
+    await startDownload({
+      url: "data:application/pdf;base64," + b64,
+      filename: `${ROOT}/${active.dir}/${name}`,
+    });
+  } catch (err) {
+    console.warn("deck viewer print failed:", err);
+  } finally {
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch (_) {
+      /* tab already gone */
+    }
+    if (active) active.lastActivity = Date.now();
+  }
+});
+
 // --- Message handlers. -------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg) return false;
   if (msg.kind === "am-arm") {
-    arm(msg)
+    arm(msg, sender.tab)
       .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true;
@@ -80,10 +117,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true; // async sendResponse
   }
+  // Legacy shim: a stale content script (from before an extension reload, when
+  // the tab wasn't refreshed) sends the old single-message format. Handle it
+  // so the capture doesn't hang silently. Reload the page to get the new flow.
+  if (msg.kind === "angel-memos-capture") {
+    console.warn("[angel-memos] legacy capture message — reload the tab for full deck capture");
+    arm(msg, sender.tab)
+      .then(() => run({ attachments: msg.attachments || [], docClicks: 0 }, sender.tab))
+      .then((count) => sendResponse({ ok: true, count }))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
   return false;
 });
 
-async function arm(msg) {
+async function arm(msg, tab) {
   const company = (msg.company || "").trim();
   const dir = sanitizeFolder(company);
   if (!dir) throw new Error("empty company name");
@@ -93,10 +141,12 @@ async function arm(msg) {
     dir,
     tier: msg.tier === "quick" ? "quick" : "none",
     sourceUrl: msg.sourceUrl || "",
+    tabId: tab ? tab.id : null,
     startedAt: now,
     lastActivity: now,
     buttonsDone: false,
     pending: new Set(),
+    viewerTabs: new Set(),
     completed: 0,
   };
 }
@@ -104,19 +154,26 @@ async function arm(msg) {
 async function run(msg, tab) {
   if (!active) throw new Error("capture not armed");
   const dir = active.dir;
+  console.log(`[angel-memos] capturing "${active.company}" ->`, dir);
 
-  // 1. Deal page -> PDF (the AngelList memo/narrative itself).
+  // 1. Deal page -> PDF (the AngelList memo/narrative itself). Time-boxed so a
+  //    hung debugger attach (e.g. DevTools open, another debugger attached)
+  //    can never freeze the whole capture.
   try {
-    const pdfBase64 = await printPageToPdf(tab.id);
+    const pdfBase64 = await withTimeout(
+      printPageToPdf(tab.id),
+      PRINT_TIMEOUT_MS,
+      "page print"
+    );
     await startDownload({
       url: "data:application/pdf;base64," + pdfBase64,
       filename: `${ROOT}/${dir}/angellist - ${active.company}.pdf`,
     });
   } catch (err) {
-    console.warn("page PDF failed:", err);
+    console.warn("[angel-memos] page PDF failed (continuing):", err);
   }
 
-  // 2. Any real anchor attachments (standard deal pages).
+  // 2. Anchor attachments + embedded PDF viewer sources.
   for (const url of msg.attachments || []) {
     try {
       await startDownload({ url, filename: `${ROOT}/${dir}/${basename(url)}` });
@@ -125,9 +182,10 @@ async function run(msg, tab) {
     }
   }
 
-  // 3. The dataroom document downloads (deck etc.) were already clicked by the
-  //    content script; they arrive via the router. Wait for everything to
-  //    settle, then write job.json LAST.
+  // 3. The dataroom download buttons were clicked by the content script (their
+  //    downloads arrive via the router) and any deck viewer tab is being
+  //    printed by the tab watcher. Wait for everything to settle, then write
+  //    job.json LAST.
   active.buttonsDone = true;
   active.lastActivity = Date.now();
   await waitForQuiescence();
@@ -148,9 +206,9 @@ async function run(msg, tab) {
   return count;
 }
 
-// Resolve once no download has started/finished for QUIET_MS and nothing is
-// pending — but never before MIN_RUN_MS (so slow dataroom fetches have time to
-// begin) and never after MAX_RUN_MS (so a stuck download can't hang forever).
+// Resolve once no download/tab activity for QUIET_MS with nothing pending and
+// no viewer tab still loading — but never before MIN_RUN_MS (slow dataroom
+// fetches / viewer loads need time) nor after MAX_RUN_MS (stuck-work backstop).
 function waitForQuiescence() {
   return new Promise((resolve) => {
     const check = () => {
@@ -159,9 +217,9 @@ function waitForQuiescence() {
       const sinceRun = now - active.startedAt;
       const idle = now - active.lastActivity;
       if (sinceRun > MAX_RUN_MS) return resolve();
-      if (sinceRun > MIN_RUN_MS && active.pending.size === 0 && idle > QUIET_MS) {
-        return resolve();
-      }
+      const quiet =
+        active.pending.size === 0 && active.viewerTabs.size === 0 && idle > QUIET_MS;
+      if (sinceRun > MIN_RUN_MS && quiet) return resolve();
       setTimeout(check, 800);
     };
     setTimeout(check, 800);
@@ -195,6 +253,11 @@ function isAngelListItem(item) {
   return /angellist\.com/i.test(hay);
 }
 
+function deckFilename(title) {
+  const base = sanitizeFile((title || "deck").replace(/\s*\|\s*angellist.*$/i, ""));
+  return /\.pdf$/i.test(base) ? base : `${base}.pdf`;
+}
+
 function sanitizeFolder(name) {
   return (name || "")
     .replace(/[<>:"/\\|?*]/g, " ")
@@ -220,7 +283,6 @@ function basename(pathOrUrl) {
     const last = decodeURIComponent(path.split("/").filter(Boolean).pop() || "");
     return sanitizeFile(last);
   } catch {
-    // Not a URL (e.g. a browser-suggested filename path) — take the last segment.
     const last = raw.split(/[\\/]/).filter(Boolean).pop() || "";
     return sanitizeFile(last);
   }
