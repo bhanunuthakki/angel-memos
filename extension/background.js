@@ -154,7 +154,10 @@ async function arm(msg, tab) {
 async function run(msg, tab) {
   if (!active) throw new Error("capture not armed");
   const dir = active.dir;
-  console.log(`[angel-memos] capturing "${active.company}" ->`, dir);
+  console.log(
+    `[angel-memos] capturing "${active.company}" -> ${dir} ` +
+      `(deck: ${msg.deckMode || "n/a"}, urls: ${(msg.attachments || []).length})`
+  );
 
   // 1. Deal page -> PDF (the AngelList memo/narrative itself). Time-boxed so a
   //    hung debugger attach (e.g. DevTools open, another debugger attached)
@@ -202,6 +205,7 @@ async function run(msg, tab) {
   });
 
   const count = active.completed;
+  console.log(`[angel-memos] done "${active.company}": ${count} file(s) saved`);
   active = null;
   return count;
 }
@@ -244,6 +248,24 @@ function startDownload(options) {
   return chrome.downloads.download(
     Object.assign({ conflictAction: "uniquify", saveAs: false }, options)
   );
+}
+
+// Reject if `promise` doesn't settle within `ms`, so an unbounded await
+// (e.g. a debugger attach that never resolves) can't hang the capture.
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
 }
 
 // --- Helpers. ----------------------------------------------------------------

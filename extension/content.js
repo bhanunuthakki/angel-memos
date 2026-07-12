@@ -1,26 +1,42 @@
 // Angel Memos Capture — content script.
-// Injects a small floating panel on AngelList pages. On click it captures the
-// deal into Downloads/angel-memos/<Company>/:
-//   1. arms the background download-router for this company,
-//   2. clicks the dataroom document download buttons (deck/docs are JS buttons
-//      with aria-label="Download"/"Download all", NOT <a href> links),
-//   3. if the deck is VIEW-ONLY (no download control), opens the deck viewer
-//      so the background can print it to PDF like the AL memo,
-//   4. hands any real <a href> attachments and embedded PDF viewer sources to
-//      the background too,
-//   5. background prints the deal page + any viewer tab, then writes job.json
-//      LAST as the drop-completeness marker.
+// Injects a floating panel on AngelList pages. Captures ONLY the two things
+// the diligence pipeline needs into Downloads/angel-memos/<Company>/:
+//   1. the AL memo   — the deal page itself, printed to PDF by the background;
+//   2. the deck      — the ONE document row whose name is the pitch deck.
+//
+// Everything else in the dataroom (closing documents, disclaimers, etc.) is
+// deliberately IGNORED. The deck is usually view-only (a clickable table cell
+// with no download button), while the junk docs are the ones that DO have
+// download buttons — so "download every button" grabbed exactly the wrong set.
+// We instead find the deck row by name and either click its download control
+// or open its viewer so the background can print it, like the AL memo.
 
 (() => {
   if (document.getElementById("angel-memos-panel")) return;
 
   const PANEL_ID = "angel-memos-panel";
+  const DECK_RE = /\b(pitch\s*deck|deck|presentation)\b/i;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const send = (msg) =>
+
+  // Never let the UI hang: if the worker dies mid-capture the message port
+  // closes (surfaced as lastError), and as a backstop we also time out.
+  const send = (msg, timeoutMs = 90000) =>
     new Promise((resolve) => {
+      let settled = false;
+      const done = (v) => {
+        if (!settled) {
+          settled = true;
+          resolve(v);
+        }
+      };
+      const timer = setTimeout(
+        () => done({ ok: false, error: "timed out waiting for background worker" }),
+        timeoutMs
+      );
       chrome.runtime.sendMessage(msg, (reply) => {
-        if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
-        else resolve(reply || { ok: false, error: "no reply" });
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) done({ ok: false, error: chrome.runtime.lastError.message });
+        else done(reply || { ok: false, error: "no reply" });
       });
     });
 
@@ -59,28 +75,34 @@
     const confirmed = window.prompt("Company folder name:", company);
     if (!confirmed) return;
 
-    // Step 1: arm the router BEFORE any page download can fire.
+    // Step 1: arm the router BEFORE any deck download/viewer can fire.
     setStatus("Arming…");
     const ack = await send({
       kind: "am-arm", company: confirmed.trim(), tier, sourceUrl: location.href,
     });
     if (!ack.ok) { setStatus("Error arming: " + ack.error); return; }
 
-    // Step 2: click the dataroom document download buttons (deck + docs).
-    const clicked = clickDataroomDownloads();
+    // Step 2: act ONLY on the deck. Returns { mode, urls }.
+    const deck = captureDeck();
+    if (deck.mode === "none") {
+      setStatus("Capturing page (no deck found)…");
+    } else if (deck.mode === "view") {
+      setStatus("Opening deck…");
+    } else {
+      setStatus("Downloading deck…");
+    }
 
-    // Step 3: if nothing obviously downloaded the deck, open the deck viewer
-    // so the background can print it to PDF (the view-only-deck case).
-    const deckOpened = openDeckViewer();
+    // Step 3: if the deck is view-only, give the viewer a moment and also try
+    // to grab an in-page embedded PDF source (some viewers render an <iframe>).
+    let attachments = deck.urls;
+    if (deck.mode === "view") {
+      await sleep(1800);
+      attachments = [...attachments, ...collectEmbeddedPdfSrcs()];
+    }
 
-    // Step 4: give the viewer a moment to open, then gather anchor links and
-    // any embedded PDF viewer sources.
-    setStatus(clicked ? `Downloading ${clicked} doc(s)…` : "Capturing…");
-    await sleep(deckOpened ? 1800 : 300);
-    const attachments = [...collectAttachmentLinks(), ...collectEmbeddedPdfSrcs()];
-
-    // Step 5: background prints the page (+ any viewer tab) and finalizes.
-    const reply = await send({ kind: "am-run", attachments, docClicks: clicked, deckOpened });
+    // Step 4: background prints the deal page (+ any deck viewer tab), downloads
+    // the deck url(s), waits for everything to settle, then writes job.json LAST.
+    const reply = await send({ kind: "am-run", attachments, deckMode: deck.mode });
     setStatus(reply.ok ? `Saved ${reply.count} file(s) ✓` : "Failed: " + reply.error);
   }
 
@@ -102,66 +124,66 @@
     return text.replace(/\s+/g, " ").trim().slice(0, 80);
   }
 
-  // Dataroom documents are download buttons (aria-label "Download"/"Download
-  // all"), no href. Prefer "Download all" (grabs the deck + everything as a
-  // zip the watcher unpacks); else click each per-document button. Returns
-  // the count clicked.
-  function clickDataroomDownloads() {
-    const all = document.querySelector('button[aria-label="Download all" i]');
-    if (all) {
-      all.click();
-      return 1;
-    }
-    const perDoc = [...document.querySelectorAll('button[aria-label="Download" i]')];
-    for (const btn of perDoc) btn.click();
-    return perDoc.length;
-  }
-
-  // View-only decks have no download control — they open in a viewer (a new
-  // tab or an in-page embed). Click the deck control so the background can
-  // capture the resulting PDF. Returns whether a deck control was clicked.
-  function openDeckViewer() {
-    const inPanel = (el) => el.closest && el.closest("#" + PANEL_ID);
-    const looksLikeDeck = (el) => {
-      const label = (el.getAttribute("aria-label") || "") + " " + (el.textContent || "");
-      return /\bdeck\b|\bpitch deck\b|view deck/i.test(label);
-    };
-    const candidates = [
-      ...document.querySelectorAll('a, button, [role="button"]'),
-    ].filter((el) => !inPanel(el) && looksLikeDeck(el));
-    // Shortest label first — avoids clicking a big container that merely
-    // contains the word "deck".
-    candidates.sort(
-      (a, b) => (a.textContent || "").length - (b.textContent || "").length
-    );
-    if (candidates[0]) {
-      candidates[0].click();
-      return true;
-    }
-    return false;
-  }
-
-  // Real anchor attachments (standard deal pages that DO use links).
-  function collectAttachmentLinks() {
-    const urls = new Set();
-    for (const a of document.querySelectorAll("a[href]")) {
-      const href = a.href;
-      if (!href || !href.startsWith("http")) continue;
-      const lower = href.toLowerCase();
-      if (
-        lower.includes(".pdf") ||
-        lower.includes("/attachments/") ||
-        (lower.includes("document") && lower.includes("download"))
-      ) {
-        urls.add(href);
+  // Capture ONLY the deck. Datarooms render documents in a <table>: the deck is
+  // the row whose name matches DECK_RE. If that row has a download control we
+  // click it (the background router files it into the folder); if it's
+  // view-only (a clickable cell, no button) we click it to open the viewer so
+  // the background prints it. Non-table pages fall back to a deck-named
+  // link/button. Returns { mode: 'download'|'view'|'none', urls: string[] }.
+  function captureDeck() {
+    const cell = findDeckCell();
+    if (cell) {
+      const row = cell.closest("tr") || cell.parentElement;
+      const dl =
+        row &&
+        row.querySelector('button[aria-label="Download" i], a[download], a[href$=".pdf" i]');
+      if (dl) {
+        dl.click();
+        return { mode: "download", urls: [] };
       }
+      // View-only deck cell (cursor:pointer, no download control).
+      cell.click();
+      return { mode: "view", urls: [] };
     }
-    return [...urls];
+    // Fallback for non-dataroom pages: a deck-named link or control.
+    const ctrl = findDeckControl();
+    if (!ctrl) return { mode: "none", urls: [] };
+    const href = ctrl.getAttribute && ctrl.getAttribute("href");
+    if (href && /^https?:/i.test(href) && /\.pdf(\?|$)/i.test(href)) {
+      return { mode: "download", urls: [href] }; // background downloads it
+    }
+    ctrl.click();
+    return { mode: "view", urls: [] };
   }
 
-  // Embedded PDF viewers: an <iframe>/<embed>/<object> whose source is an
-  // https PDF/document URL. (blob: sources are context-scoped and can't be
-  // fetched by the background — those fall to the viewer-tab print path.)
+  // The deck's document-name cell: a short <td> whose text names a deck.
+  function findDeckCell() {
+    return (
+      [...document.querySelectorAll("td")].find((td) => {
+        const t = (td.textContent || "").trim();
+        return t.length > 0 && t.length < 45 && DECK_RE.test(t);
+      }) || null
+    );
+  }
+
+  // Non-table fallback: a deck-named <a>/<button>/[role=button], shortest label
+  // first (so we click the deck control, not a container mentioning "deck").
+  function findDeckControl() {
+    const inPanel = (el) => el.closest && el.closest("#" + PANEL_ID);
+    const isDeck = (el) => {
+      const label = (el.getAttribute("aria-label") || "") + " " + (el.textContent || "");
+      return DECK_RE.test(label) && (el.textContent || "").trim().length < 40;
+    };
+    const candidates = [...document.querySelectorAll('a, button, [role="button"]')].filter(
+      (el) => !inPanel(el) && isDeck(el)
+    );
+    candidates.sort((a, b) => (a.textContent || "").length - (b.textContent || "").length);
+    return candidates[0] || null;
+  }
+
+  // In-page embedded PDF viewer: an <iframe>/<embed>/<object> whose source is an
+  // https PDF/document URL (blob: sources are context-scoped and can't be
+  // fetched by the background — those fall to the viewer-tab print path).
   function collectEmbeddedPdfSrcs() {
     const urls = new Set();
     for (const el of document.querySelectorAll("iframe[src], embed[src], object[data]")) {

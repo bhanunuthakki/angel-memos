@@ -10,32 +10,35 @@ On any AngelList page a small panel appears (bottom-right):
   the quick tier (diligence + scorecard) automatically.
 - **Save only** — capture without triggering research.
 
-Capture writes into `Downloads/angel-memos/<Company>/`:
-1. prints the deal page to PDF (`angellist - <Company>.pdf`);
-2. grabs the dataroom documents (closing docs, disclaimers, and the **deck**
-   when it has a download control). These are JS **buttons**
-   (`aria-label="Download"` / `"Download all"`), *not* links — the extension
-   clicks them and a background download-router reroutes the resulting files
-   into the company folder. "Download all" arrives as a zip the watcher
-   unpacks on ingest;
-3. handles the **view-only deck** (the common case where the deck has no
-   download control): the extension clicks the deck open, and if it opens in
-   a new tab the background prints *that* tab to PDF — same mechanism as the
-   AL memo. Embedded PDF viewers (`<iframe>`/`<embed>` with an https source)
-   are captured by URL;
-4. writes `job.json` **last** — the watcher treats it as the "drop is
-   complete" marker, so it's only written after downloads + the deck viewer
-   settle.
+Capture writes **only two things** into `Downloads/angel-memos/<Company>/` —
+the memo and the deck. Everything else in the dataroom (closing documents,
+disclaimers, etc.) is deliberately ignored.
 
-Standard deal pages that expose real `<a href>` attachment links still work
-too — those are downloaded directly.
+1. **AL memo** — the deal page itself, printed to PDF
+   (`angellist - <Company>.pdf`) via Chrome's debugger API.
+2. **Deck** — the extension finds the *one* dataroom document row whose name
+   is the pitch deck (`/deck|pitch|presentation/`) and acts only on it:
+   - if that row has a download control, it clicks it and a background
+     download-router files the result into the company folder;
+   - if the deck is **view-only** (a clickable table cell with no download
+     button — the common case), it clicks the deck open; when the viewer
+     opens in a new tab the background prints *that* tab to PDF, same as the
+     AL memo. In-page embedded PDF viewers (`<iframe>`/`<embed>` with an
+     https source) are captured by URL.
+3. `job.json` is written **last** — the watcher treats it as the "drop is
+   complete" marker, so it lands only after the memo + deck settle.
+
+The junk-document rows (the ones that *do* have download buttons) are never
+clicked, so closing docs and disclaimers no longer come through.
 
 > **Deck capture is best-effort and needs a live test.** Datarooms vary in
-> how they expose the deck (download button, embedded viewer, new-tab
-> viewer, or a canvas/image renderer with no PDF URL at all — that last case
-> still can't be auto-captured). After reloading the extension, capture one
-> deal and confirm a deck PDF lands in the folder; if not, open the deck and
-> use the browser's own Print → Save as PDF into the company folder.
+> how they open the deck (new-tab viewer, embedded `<iframe>`, or a
+> canvas/image renderer with no PDF URL — that last case still can't be
+> auto-captured). After reloading the extension, capture one deal and confirm
+> a deck PDF lands in the folder; if not, open the deck and use the browser's
+> own Print → Save as PDF into the company folder. The service-worker console
+> logs `[angel-memos] capturing "…" (deck: view|download|none)` so you can see
+> which path fired.
 
 ## Install (load unpacked)
 
@@ -68,8 +71,8 @@ schtasks /Create /TN "angel-memos-watch" /SC ONLOGON /TR "\"$env:USERPROFILE\.ve
 
 ## Security notes
 
-- The extension only reads pages you click the button on, only on
-  AngelList domains, and downloads only same-page links.
+- The extension only acts on pages where you click its button, only on
+  AngelList domains, and captures only the memo page + the deck.
 - It never sees or handles your AngelList credentials — it rides the
   session in your normal logged-in tab.
 - Everything stays local: page PDF and attachments go to your Downloads
