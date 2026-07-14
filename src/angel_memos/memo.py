@@ -72,6 +72,7 @@ class StaleEntryError(RuntimeError):
     """Raised when cached entry JSONs were generated from a different
     decision.md than the one now on disk. Re-run `memo`, or `--force`."""
 
+
 _MEMO_SYSTEM_PROMPT = """You are a senior investment analyst writing a 2-3 page
 adversarial bull/bear investment memo for an angel-stage private company.
 Operate in two modes simultaneously:
@@ -425,8 +426,10 @@ def _generate_long_memo(
     angellist: AngelListMetadata,
     decision: Decision,
 ) -> str:
-    """Build the bull/bear memo-generation prompt and call Claude.
-    Returns the raw Markdown body."""
+    """Build the bull/bear memo-generation prompt and call Claude, validating
+    the result. Retries once, then raises, so a refusal / usage-limit banner /
+    truncated response is never archived as the permanent investment rationale.
+    """
     with tempfile.TemporaryDirectory(prefix="angel_memos_memo_") as tmp_str:
         tmp_dir = Path(tmp_str)
         al_pngs = rasterize_pdf(materials.angellist.path, tmp_dir / "al")
@@ -434,7 +437,36 @@ def _generate_long_memo(
         if materials.deck is not None:
             deck_pngs = rasterize_pdf(materials.deck.path, tmp_dir / "deck")
         prompt = _format_memo_prompt(al_pngs, deck_pngs, materials, angellist, decision)
-        return call_claude(prompt, model=OPUS_MODEL)
+
+        last_problem = ""
+        for _attempt in range(2):
+            memo_md = call_claude(prompt, model=OPUS_MODEL)
+            missing = _validate_long_memo(memo_md)
+            if not missing:
+                return memo_md
+            last_problem = "; ".join(missing)
+        raise RuntimeError(
+            f"Generated memo failed validation ({last_problem}). The response "
+            f"looks like a refusal, a usage-limit banner, or a truncated memo — "
+            f"refusing to save it as memo_private.md."
+        )
+
+
+# The nine numbered sections the memo system prompt mandates.
+_REQUIRED_MEMO_SECTIONS: tuple[str, ...] = tuple(f"## {n}." for n in range(1, 10))
+_MIN_MEMO_CHARS = 1500
+
+
+def _validate_long_memo(md: str) -> list[str]:
+    """Return a list of structural problems with a generated memo (empty when
+    it looks like a real 9-section bull/bear memo)."""
+    problems: list[str] = []
+    if len(md.strip()) < _MIN_MEMO_CHARS:
+        problems.append(f"too short ({len(md.strip())} < {_MIN_MEMO_CHARS} chars)")
+    missing = [s for s in _REQUIRED_MEMO_SECTIONS if s not in md]
+    if missing:
+        problems.append("missing sections: " + ", ".join(missing))
+    return problems
 
 
 def _format_memo_prompt(

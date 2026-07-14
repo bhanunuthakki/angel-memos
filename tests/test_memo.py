@@ -21,6 +21,7 @@ from angel_memos.memo import (
     StaleEntryError,
     _check_entry_freshness,
     _guard_public_entry,
+    _validate_long_memo,
     _write_entry_meta,
 )
 from angel_memos.models import Conviction, Decision, ValuationMethod, Verdict
@@ -103,9 +104,7 @@ def test_guard_raises_on_exact_figure_leak(tmp_path: Path) -> None:
 
 
 def test_guard_raises_on_review_marker(tmp_path: Path) -> None:
-    entry = _public_entry(
-        why_is_it_important="[NEEDS BHANU REVIEW: confirm the moat] It matters."
-    )
+    entry = _public_entry(why_is_it_important="[NEEDS BHANU REVIEW: confirm the moat] It matters.")
     with pytest.raises(PublicMemoLeakError):
         _guard_public_entry(tmp_path, _decision(), entry)
 
@@ -135,3 +134,28 @@ def test_freshness_raises_when_decision_edited(tmp_path: Path) -> None:
 def test_freshness_noop_when_meta_absent(tmp_path: Path) -> None:
     (tmp_path / "decision.md").write_text("company: X\n", encoding="utf-8")
     _check_entry_freshness(tmp_path)  # no meta -> can't prove staleness -> allow
+
+
+# ---------------------------------------------------------------------------
+# Long-memo validation (#8): never save a refusal/truncation as the memo.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_long_memo_accepts_full_nine_section_memo() -> None:
+    body = "# Acme — Investment Memo\n\n" + "\n\n".join(
+        f"## {n}. Section {n}\n" + ("lorem ipsum " * 40) for n in range(1, 10)
+    )
+    assert _validate_long_memo(body) == []
+
+
+def test_validate_long_memo_flags_refusal_text() -> None:
+    problems = _validate_long_memo("I can't help with that request.")
+    assert problems  # too short + missing sections
+
+
+def test_validate_long_memo_flags_truncated_memo() -> None:
+    body = "# Acme — Investment Memo\n\n" + "\n\n".join(
+        f"## {n}. Section {n}\n" + ("lorem ipsum " * 40) for n in range(1, 6)
+    )  # only sections 1-5
+    problems = _validate_long_memo(body)
+    assert any("missing sections" in p for p in problems)

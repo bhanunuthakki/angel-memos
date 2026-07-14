@@ -5,7 +5,6 @@ skips tool-generated outputs."""
 from pathlib import Path
 
 import pytest
-
 from pydantic import BaseModel
 
 from angel_memos.materials import (
@@ -22,6 +21,7 @@ from angel_memos.materials import (
 
 class _Toy(BaseModel):
     value: str
+
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SPOTAI_AL_PDF = FIXTURES / "spotai_al.pdf"

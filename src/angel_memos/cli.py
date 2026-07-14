@@ -18,6 +18,7 @@ Company-folder resolution:
      a new `<Evaluation>/<Company>/` subfolder, then proceed.
 """
 
+import re
 import shutil
 import time
 from pathlib import Path
@@ -204,7 +205,7 @@ def watch(inbox: Path | None, interval: int) -> None:
                     # or wedge the daemon.
                     try:
                         _run_quick_tier(result)
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         click.echo(
                             f"  ERROR: quick tier failed for {result.job.company}: {exc}. "
                             f"Re-run manually: angel-memos diligence '{result.job.company}' "
@@ -335,10 +336,21 @@ def _resolve_company_folder(company: str, override: Path | None, cfg: Config) ->
         return resolved
 
     portfolio_folder = cfg.portfolio_root / company
+    evaluation_folder = cfg.evaluation_root / company
     if portfolio_folder.is_dir():
+        if evaluation_folder.is_dir():
+            # A follow-on capture landed in Evaluation while the committed deal
+            # lives in Portfolio. Resolving to Portfolio here (with its stale
+            # cache) while ingest fed the new materials into Evaluation would
+            # silently score/decide on the OLD round. Make the split visible.
+            click.echo(
+                f"  WARNING: '{company}' exists in BOTH Portfolio and Evaluation. "
+                f"Using Portfolio/{company}; the Evaluation copy (a follow-on "
+                f"capture?) is ignored. Pass --folder to target it explicitly.",
+                err=True,
+            )
         return portfolio_folder
 
-    evaluation_folder = cfg.evaluation_root / company
     if evaluation_folder.is_dir():
         return evaluation_folder
 
@@ -360,11 +372,40 @@ def _resolve_company_folder(company: str, override: Path | None, cfg: Config) ->
     return evaluation_folder
 
 
-def _flat_matches(root: Path, company: str) -> list[Path]:
-    """Find flat files in `root` whose names start with `<Company> `.
+# Tokens that legitimately follow a company name in a materials filename.
+# Requiring the token immediately after `<Company> ` to be one of these stops
+# resolving "Acme" from sweeping in "Acme Robotics AL.pdf" (whose next token,
+# "Robotics", identifies a DIFFERENT company).
+_ARTIFACT_TOKENS: frozenset[str] = frozenset(
+    {
+        "al",
+        "angellist",
+        "angel",
+        "deck",
+        "pitch",
+        "details",
+        "memo",
+        "notes",
+        "note",
+        "links",
+        "seed",
+        "preseed",
+        "series",
+        "round",
+        "terms",
+        "call",
+    }
+)
 
-    Glob is case-insensitive on Windows; we still filter explicitly so
-    behavior is identical across OSes."""
+
+def _flat_matches(root: Path, company: str) -> list[Path]:
+    """Find flat files in `root` whose names start with `<Company> ` AND whose
+    next token is a known materials-artifact word.
+
+    The artifact-token gate is what keeps `<Company>` from matching a longer
+    company that shares its prefix: 'Acme Robotics AL.pdf' has next token
+    'Robotics' (not an artifact word), so it is NOT swept in when resolving
+    'Acme'."""
     if not root.is_dir():
         return []
     matches: list[Path] = []
@@ -374,7 +415,12 @@ def _flat_matches(root: Path, company: str) -> list[Path]:
             continue
         if path.suffix.lower() not in {".pdf", ".md", ".txt"}:
             continue
-        if path.name.lower().startswith(prefix):
+        name = path.name.lower()
+        if not name.startswith(prefix):
+            continue
+        remainder = name[len(prefix) :]
+        first_token = re.split(r"[\s._\-]+", remainder, maxsplit=1)[0]
+        if first_token in _ARTIFACT_TOKENS:
             matches.append(path)
     return matches
 

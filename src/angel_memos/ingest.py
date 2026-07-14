@@ -157,7 +157,7 @@ def run_ingest(
     for drop in scan_inbox(inbox):
         try:
             results.append(ingest_folder(drop, cfg))
-        except Exception as exc:  # noqa: BLE001 — isolate one bad drop from the batch
+        except Exception as exc:
             logger.warning("quarantining unprocessable drop %s: %s", drop, exc)
             _quarantine(drop)
             if on_error is not None:

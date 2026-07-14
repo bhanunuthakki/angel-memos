@@ -161,9 +161,7 @@ def test_leak_gate_catches_exact_dollar_figure() -> None:
 
 
 def test_leak_gate_catches_review_marker() -> None:
-    leaks = find_public_leaks(
-        "[NEEDS BHANU REVIEW: is the moat real?]", company="Spot AI"
-    )
+    leaks = find_public_leaks("[NEEDS BHANU REVIEW: is the moat real?]", company="Spot AI")
     assert "review-marker" in leaks
 
 

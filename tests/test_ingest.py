@@ -274,9 +274,7 @@ def test_scan_inbox_skips_quarantined_drops(tmp_path: Path) -> None:
 
 def test_ingest_sanitizes_illegal_chars_in_company_name(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
-    drop = _make_drop(
-        tmp_path / "inbox", name="drop", job={"company": "Re:Build", "tier": "none"}
-    )
+    drop = _make_drop(tmp_path / "inbox", name="drop", job={"company": "Re:Build", "tier": "none"})
     result = ingest_folder(drop, cfg)
     # Colon replaced; folder is a single component directly under Evaluation.
     assert result.folder.parent == cfg.evaluation_root.resolve()
