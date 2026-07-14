@@ -107,6 +107,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
       url: "data:application/pdf;base64," + b64,
       filename: `${ROOT}/${active.dir}/${name}`,
     });
+    if (active) active.deckCaptured = true;
   } catch (err) {
     console.warn("[angel-memos] deck viewer print failed:", err);
   } finally {
@@ -166,6 +167,7 @@ async function arm(msg, tab) {
     pending: new Set(),
     viewerTabs: new Set(),
     completed: 0,
+    deckCaptured: false,
   };
   console.log(`[angel-memos] armed for "${company}" -> ${ROOT}/${dir}/`);
 }
@@ -174,9 +176,13 @@ async function printMemo(tab) {
   if (!active) throw new Error("capture not armed");
   if (!tab || tab.id == null) throw new Error("no sender tab");
   const b64 = await withTimeout(printPageToPdf(tab.id), PRINT_TIMEOUT_MS, "page print");
+  // Sanitize the leaf name: a raw company name with an illegal char (":", "?",
+  // etc.) makes chrome.downloads silently reject the memo, so the drop lands
+  // with NO angellist*.pdf and diligence can't run.
+  const memoLeaf = sanitizeFile(`angellist - ${active.company}`);
   await startDownload({
     url: "data:application/pdf;base64," + b64,
-    filename: `${ROOT}/${active.dir}/angellist - ${active.company}.pdf`,
+    filename: `${ROOT}/${active.dir}/${memoLeaf}.pdf`,
   });
   console.log(`[angel-memos] memo printed for "${active.company}"`);
 }
@@ -195,6 +201,7 @@ async function downloadDeckUrl(msg) {
   }
   const name = sanitizeFile(msg.name || "deck.pdf");
   await startDownload({ url, filename: `${ROOT}/${active.dir}/${name}` });
+  active.deckCaptured = true;
   console.log(`[angel-memos] deck download started: ${name}`);
 }
 
@@ -204,9 +211,15 @@ async function finalize() {
   await waitForQuiescence();
 
   const job = {
-    company: active.company,
+    // Write the sanitized folder name so job.company and the drop/Evaluation
+    // folder always agree (ingest re-sanitizes defensively regardless).
+    company: active.dir,
     tier: active.tier,
     source_url: active.sourceUrl,
+    // Observability for the watcher; ingest still derives missing_deck from the
+    // actual files, so this is a hint, not the source of truth.
+    deck_captured: active.deckCaptured,
+    pending_at_finalize: active.pending.size,
   };
   const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(job, null, 2))));
   await startDownload({

@@ -177,13 +177,28 @@ def watch(inbox: Path | None, interval: int) -> None:
     launch /angel-research from a Claude Code session. Ctrl+C to stop."""
     cfg = load_config()
     target_inbox = inbox or default_inbox()
+
+    def _on_ingest_error(drop: Path, exc: Exception) -> None:
+        click.echo(f"  QUARANTINED bad drop {drop.name}: {exc}", err=True)
+
     click.echo(f"Watching {target_inbox} (every {interval}s). Ctrl+C to stop.")
     while True:
         try:
-            for result in run_ingest(target_inbox, cfg):
+            for result in run_ingest(target_inbox, cfg, on_error=_on_ingest_error):
                 _echo_ingest(result)
                 if result.job.tier == "quick":
-                    _run_quick_tier(result)
+                    # Isolate quick-tier failures per drop: a transient Claude
+                    # error on one company must not abort ingestion of the rest
+                    # or wedge the daemon.
+                    try:
+                        _run_quick_tier(result)
+                    except Exception as exc:  # noqa: BLE001
+                        click.echo(
+                            f"  ERROR: quick tier failed for {result.job.company}: {exc}. "
+                            f"Re-run manually: angel-memos diligence '{result.job.company}' "
+                            f"&& angel-memos score '{result.job.company}'",
+                            err=True,
+                        )
         except KeyboardInterrupt:
             raise
         except Exception as exc:
@@ -196,6 +211,12 @@ def _echo_ingest(result: IngestResult) -> None:
     if result.missing_angellist:
         click.echo(
             "  WARNING: no angellist*.pdf in this drop — diligence needs the AL memo.",
+            err=True,
+        )
+    if result.missing_deck:
+        click.echo(
+            "  WARNING: no deck/pitch PDF in this drop — the scorecard will run "
+            "deck-less and be lower-confidence. Re-capture the deck if possible.",
             err=True,
         )
 

@@ -233,3 +233,99 @@ def test_run_ingest_processes_all_ready_drops(tmp_path: Path) -> None:
     _make_drop(inbox, name="Beta", job={"company": "Beta", "tier": "none"})
     results = run_ingest(inbox, cfg)
     assert sorted(r.job.company for r in results) == ["Acme", "Beta"]
+
+
+# ---------------------------------------------------------------------------
+# Fault isolation (#4): one bad drop must not abort the batch or wedge watch.
+# ---------------------------------------------------------------------------
+
+
+def test_run_ingest_isolates_and_quarantines_a_bad_drop(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    inbox = tmp_path / "inbox"
+    # "AAA_bad" sorts BEFORE "Zeta" so, pre-fix, its failure aborted the batch
+    # and Zeta was never reached.
+    bad = _make_drop(inbox, name="AAA_bad", job={"company": ""})  # empty -> invalid
+    _make_drop(inbox, name="Zeta", job={"company": "Zeta", "tier": "none"})
+
+    errors: list[tuple[Path, Exception]] = []
+    results = run_ingest(inbox, cfg, on_error=lambda d, e: errors.append((d, e)))
+
+    # The good drop still processed despite the bad one sorting first.
+    assert [r.job.company for r in results] == ["Zeta"]
+    assert len(errors) == 1
+    # The bad drop was quarantined so it will not be re-scanned.
+    assert not bad.exists()
+    assert (inbox / "AAA_bad.failed").is_dir()
+    assert scan_inbox(inbox) == []  # quarantined dir is skipped
+
+
+def test_scan_inbox_skips_quarantined_drops(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    drop = _make_drop(inbox, name="Acme")
+    drop.rename(inbox / "Acme.failed")
+    assert scan_inbox(inbox) == []
+
+
+# ---------------------------------------------------------------------------
+# Company-name sanitization + traversal guard (#6).
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_sanitizes_illegal_chars_in_company_name(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    drop = _make_drop(
+        tmp_path / "inbox", name="drop", job={"company": "Re:Build", "tier": "none"}
+    )
+    result = ingest_folder(drop, cfg)
+    # Colon replaced; folder is a single component directly under Evaluation.
+    assert result.folder.parent == cfg.evaluation_root.resolve()
+    assert ":" not in result.folder.name
+
+
+def test_ingest_neutralizes_traversal_separators_and_stays_in_root(tmp_path: Path) -> None:
+    """A name like '../../evil' has its separators replaced, so it can't
+    escape — it lands as a single harmless folder directly under Evaluation."""
+    cfg = _cfg(tmp_path)
+    drop = _make_drop(
+        tmp_path / "inbox", name="drop", job={"company": "../../evil", "tier": "none"}
+    )
+    result = ingest_folder(drop, cfg)
+    root = cfg.evaluation_root.resolve()
+    assert result.folder.parent == root  # single component, inside the root
+    assert root in result.folder.parents or result.folder.parent == root
+    # No directory was created outside the Evaluation root.
+    assert not (root.parent / "evil").exists()
+
+
+def test_ingest_rejects_degenerate_dot_name(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    drop = _make_drop(tmp_path / "inbox", name="drop", job={"company": "..", "tier": "none"})
+    with pytest.raises(ValueError):
+        ingest_folder(drop, cfg)
+
+
+def test_ingest_degenerate_drop_is_quarantined_by_run_ingest(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    inbox = tmp_path / "inbox"
+    _make_drop(inbox, name="evil", job={"company": "..", "tier": "none"})
+    results = run_ingest(inbox, cfg)
+    assert results == []
+    assert (inbox / "evil.failed").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Deck-presence flag (#5).
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_flags_missing_deck(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    drop = _make_drop(tmp_path / "inbox", files=["angellist - Acme.pdf"])
+    assert ingest_folder(drop, cfg).missing_deck is True
+
+
+def test_ingest_present_deck_not_flagged(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    drop = _make_drop(tmp_path / "inbox")  # default files include a deck
+    assert ingest_folder(drop, cfg).missing_deck is False
