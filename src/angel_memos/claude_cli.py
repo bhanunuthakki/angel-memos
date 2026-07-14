@@ -66,6 +66,16 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 OPUS_MODEL = "claude-opus-4-7"
 DEFAULT_TIMEOUT_SECONDS = 600
 
+# Tools `extract_structured` is allowed to use. Deliberately read-only: the
+# ONLY tools any caller needs are Read (rasterized PDF pages / @-file refs)
+# and WebSearch (founder + comparable-deal research). Bash, Write, Edit and
+# WebFetch are never needed — and every input is untrusted, founder-authored
+# PDF content, so a booby-trapped deck must not be able to execute code,
+# write files, or exfiltrate via an outbound fetch. Passing an explicit
+# allow-list (instead of `--permission-mode bypassPermissions`) means an
+# injected instruction to run a tool outside this set is denied, not run.
+_SAFE_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep", "WebSearch")
+
 _setup_verified: bool = False
 _claude_cli_path: str | None = None
 
@@ -174,26 +184,7 @@ def extract_structured[T: BaseModel](
     else:
         augmented_prompt = prompt + "\n\n" + schema_block
 
-    args: list[str] = [
-        _claude_cli_path,
-        "-p",
-        "--model",
-        model,
-        "--output-format",
-        "json",
-        # Non-interactive batch: permission prompts have no answerer, so
-        # tool calls (Read on PDF rasters, WebSearch for founder research)
-        # would otherwise stall. Safe here — own machine, own files.
-        "--permission-mode",
-        "bypassPermissions",
-    ]
-    # Grant Read-tool access to extra directories (e.g., a temp dir containing
-    # rasterized PDF pages). The CLI's @-references load the file content at
-    # prompt-parse time, but Claude sometimes falls back to its Read tool —
-    # which is sandboxed to the cwd unless explicitly extended.
-    if additional_dirs:
-        for d in additional_dirs:
-            args.extend(["--add-dir", d])
+    args = _build_extract_args(_claude_cli_path, model, additional_dirs)
 
     completed = subprocess.run(
         args,
@@ -237,6 +228,41 @@ def extract_structured[T: BaseModel](
         raise RuntimeError(f"expected envelope.result to be a string, got: {type(result).__name__}")
     json_text = _extract_json_block(result)
     return model_type.model_validate_json(json_text)
+
+
+def _build_extract_args(
+    cli_path: str,
+    model: str,
+    additional_dirs: list[str] | None,
+    allowed_tools: tuple[str, ...] = _SAFE_TOOLS,
+) -> list[str]:
+    """Build the `claude` argv for a structured extraction call.
+
+    Pure function so the security-critical flags (no `bypassPermissions`,
+    an explicit read-only allow-list) are unit-testable without a live CLI.
+
+    In non-interactive `-p` mode the listed `--allowedTools` run without a
+    permission prompt; any tool NOT listed is denied (there is no interactive
+    answerer), so the model cannot be steered into Bash/Write/Edit/WebFetch by
+    injected content in an untrusted PDF.
+    """
+    args: list[str] = [
+        cli_path,
+        "-p",
+        "--model",
+        model,
+        "--output-format",
+        "json",
+        "--allowedTools",
+        *allowed_tools,
+    ]
+    # Grant Read-tool access to extra directories (e.g., a temp dir containing
+    # rasterized PDF pages). The CLI's @-references load the file content at
+    # prompt-parse time, but Claude sometimes falls back to its Read tool —
+    # which is sandboxed to the cwd unless explicitly extended.
+    for d in additional_dirs or []:
+        args.extend(["--add-dir", d])
+    return args
 
 
 def _extract_json_block(text: str) -> str:

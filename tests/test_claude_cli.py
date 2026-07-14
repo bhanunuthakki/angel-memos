@@ -4,7 +4,7 @@ covered by end-to-end runs."""
 
 import pytest
 
-from angel_memos.claude_cli import _extract_json_block
+from angel_memos.claude_cli import _build_extract_args, _extract_json_block
 
 
 def test_extract_strips_leading_and_trailing_fences() -> None:
@@ -64,3 +64,34 @@ def test_extract_returns_candidate_when_unparseable() -> None:
     text = "{not actually json"
     result = _extract_json_block(text)
     assert result.startswith("{")
+
+
+# ---------------------------------------------------------------------------
+# _build_extract_args — the security-critical argv for structured extraction.
+# Untrusted, founder-authored PDFs flow into this call, so the tool surface
+# must be a read-only allow-list, never bypassPermissions.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_args_never_bypass_permissions() -> None:
+    args = _build_extract_args("claude", "claude-opus-4-7", None)
+    assert "bypassPermissions" not in args
+    assert "--permission-mode" not in args
+
+
+def test_extract_args_allowlists_only_read_only_tools() -> None:
+    args = _build_extract_args("claude", "claude-opus-4-7", None)
+    assert "--allowedTools" in args
+    tail = args[args.index("--allowedTools") + 1 :]
+    # Read + WebSearch are needed; the dangerous tools must never appear.
+    assert "Read" in tail
+    assert "WebSearch" in tail
+    for dangerous in ("Bash", "Write", "Edit", "WebFetch", "NotebookEdit"):
+        assert dangerous not in tail
+
+
+def test_extract_args_includes_add_dir_for_each_extra_dir() -> None:
+    args = _build_extract_args("claude", "m", ["/tmp/a", "/tmp/b"])
+    assert args.count("--add-dir") == 2
+    assert "/tmp/a" in args
+    assert "/tmp/b" in args
