@@ -113,6 +113,7 @@ def _usd_variants(amount: float) -> list[str]:
                 f"${b_int}B USD",
                 f"${b_int}B",
                 f"${b_one:g}B",
+                f"${b_one:g} billion",
             ]
         )
     if 1_000_000 <= amount < 1_000_000_000_000:
@@ -124,6 +125,9 @@ def _usd_variants(amount: float) -> list[str]:
                 f"${m_int}M USD",
                 f"${m_int}M",
                 f"${m_one:g}M",
+                # The `$X.5 million` word form was missing — an exact figure
+                # like "$12.5 million" slipped past the check entirely.
+                f"${m_one:g} million",
             ]
         )
     if 1_000 <= amount < 1_000_000:
@@ -162,3 +166,129 @@ def all_variants_for(amount: float) -> Iterable[str]:
     """Expose `_usd_variants` for tests and downstream callers that want to
     see what mask candidates would be generated for a given amount."""
     return _usd_variants(amount)
+
+
+# ---------------------------------------------------------------------------
+# Leak gate: deterministic pre-publish check on the public memo.
+#
+# The public entry is LLM-generated from a prompt that contains the real
+# company name, founder names, and exact figures; the model is merely
+# *instructed* to anonymize. Before anything is written to the externally
+# shared public Google Doc, scan the generated entry for any identifier that
+# should never appear and hard-fail if one survives. This is the mechanical
+# backstop the pipeline was missing.
+# ---------------------------------------------------------------------------
+
+# The review marker the public-entry prompt mandates for unvetted inferences.
+# It must never reach an external reader.
+REVIEW_MARKER = "[NEEDS BHANU REVIEW"
+
+_DOMAIN_TLDS: tuple[str, ...] = (".com", ".io", ".ai", ".co", ".xyz", ".app", ".dev", ".net")
+
+# Generic trailing words that make a company name (e.g. "Quaise Energy") — if
+# the last token is one of these, the bare stem ("Quaise") is also identifying.
+_GENERIC_TAIL_WORDS: frozenset[str] = frozenset(
+    s.lower() for s in _COMPANY_SUFFIXES if s not in {"Co", "Co.", "AI"}
+)
+
+
+class PublicMemoLeakError(RuntimeError):
+    """Raised when a would-be-published public entry still contains a
+    deal-identifying string. Carries the list of offending matches."""
+
+    def __init__(self, leaks: list[str]) -> None:
+        self.leaks = leaks
+        super().__init__(
+            "public memo still contains deal-identifying content; refusing to "
+            f"publish. Offending matches: {', '.join(leaks)}"
+        )
+
+
+def find_public_leaks(
+    text: str,
+    *,
+    company: str,
+    aliases: list[str] | None = None,
+    founders: list[str] | None = None,
+    check_usd: float | None = None,
+    post_money_usd: float | None = None,
+) -> list[str]:
+    """Return the list of deal-identifying strings found in `text` (empty if
+    clean). Case-insensitive; catches concatenated/hyphenated/domain company
+    forms, founder full names and distinctive surnames, exact dollar figures,
+    and the internal review marker."""
+    leaks: list[str] = []
+    lowered = text.casefold()
+
+    for form in _company_name_forms(company, aliases or []):
+        if _word_present(text, form):
+            leaks.append(f"company:{form}")
+    for domain in _company_domain_forms(company, aliases or []):
+        if domain.casefold() in lowered:
+            leaks.append(f"domain:{domain}")
+
+    for founder in founders or []:
+        for part in _founder_forms(founder):
+            if _word_present(text, part):
+                leaks.append(f"founder:{part}")
+
+    for amount, label in ((check_usd, "check"), (post_money_usd, "post_money")):
+        if amount is not None:
+            for variant in _usd_variants(amount):
+                if variant in text:
+                    leaks.append(f"{label}:{variant}")
+
+    if REVIEW_MARKER in text:
+        leaks.append("review-marker")
+
+    # Preserve order, drop duplicates.
+    return list(dict.fromkeys(leaks))
+
+
+def _word_present(text: str, term: str) -> bool:
+    """Case-insensitive word-boundary match. Skips terms shorter than 3 chars
+    (too collision-prone to assert on)."""
+    if len(term) < 3:
+        return False
+    return re.search(rf"\b{re.escape(term)}\b", text, re.IGNORECASE) is not None
+
+
+def _company_name_forms(company: str, aliases: list[str]) -> list[str]:
+    """Identifying textual forms of a company name: the bare name, aliases,
+    the space-stripped ('SpotAI') and hyphenated ('Spot-AI') variants, and the
+    stem with a generic trailing word removed ('Quaise' from 'Quaise Energy')."""
+    forms: list[str] = []
+    for base in [company, *aliases]:
+        base = base.strip()
+        if not base:
+            continue
+        forms.append(base)
+        collapsed = re.sub(r"\s+", "", base)
+        forms.append(collapsed)
+        forms.append(re.sub(r"\s+", "-", base))
+        tokens = base.split()
+        if len(tokens) > 1 and tokens[-1].lower() in _GENERIC_TAIL_WORDS:
+            forms.append(" ".join(tokens[:-1]))
+            forms.append("".join(tokens[:-1]))
+    return list(dict.fromkeys(f for f in forms if len(f) >= 3))
+
+
+def _company_domain_forms(company: str, aliases: list[str]) -> list[str]:
+    """`spotai.com`-style domain candidates for each name."""
+    out: list[str] = []
+    for base in [company, *aliases]:
+        stem = re.sub(r"[^0-9a-z]", "", base.casefold())
+        if len(stem) >= 3:
+            out.extend(stem + tld for tld in _DOMAIN_TLDS)
+    return list(dict.fromkeys(out))
+
+
+def _founder_forms(founder: str) -> list[str]:
+    """A founder's full name plus each distinctive name-part (len >= 5) so a
+    stray surname is caught even when the full name isn't spelled out."""
+    founder = founder.strip()
+    if not founder:
+        return []
+    forms = [founder]
+    forms.extend(tok for tok in founder.split() if len(tok) >= 5)
+    return list(dict.fromkeys(forms))

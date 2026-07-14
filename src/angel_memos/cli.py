@@ -89,12 +89,23 @@ def diligence(company: str, folder: Path | None) -> None:
         "the structured doc entries after a style-guide tweak."
     ),
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help=(
+        "Bypass the public-memo leak gate and publish even if the anonymized "
+        "entry still contains an identifier (use only after reviewing a false "
+        "positive)."
+    ),
+)
 def memo(
     company: str,
     folder: Path | None,
     no_docs: bool,
     no_review: bool,
     skip_long_memo: bool,
+    force: bool,
 ) -> None:
     """Phase B: review the decision, generate memos and exit math, publish to docs."""
     cfg = load_config()
@@ -106,6 +117,7 @@ def memo(
         append_to_docs=not no_docs,
         run_review=not no_review,
         skip_long_memo=skip_long_memo,
+        force_publish=force,
     )
     for label, path in outputs.items():
         click.echo(f"  {label}: {path}")
@@ -286,7 +298,13 @@ def review(company: str, folder: Path | None) -> None:
     default=None,
     help="Override the company folder location.",
 )
-def publish(company: str, folder: Path | None) -> None:
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Bypass the public-memo leak gate (use only after reviewing a false positive).",
+)
+def publish(company: str, folder: Path | None, force: bool) -> None:
     """Re-publish a company's cached structured entries to the Google Docs
     without regenerating them via Claude. Reads `private_entry.json` and
     (for buys) `public_entry.json` from the company folder.
@@ -297,7 +315,7 @@ def publish(company: str, folder: Path | None) -> None:
     cfg = load_config()
     target = _resolve_company_folder(company, folder, cfg)
     decision = parse_decision(target / "decision.md")
-    publish_decision_to_docs(target, cfg)
+    publish_decision_to_docs(target, cfg, force=force)
     click.echo(f"Published {decision.company} ({decision.verdict.value}) to Google Docs.")
 
 

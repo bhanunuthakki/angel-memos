@@ -42,6 +42,7 @@ from angel_memos.doc_entries import (
 )
 from angel_memos.exit_math import generate_exit_math
 from angel_memos.google_docs import insert_private_entry, insert_public_entry
+from angel_memos.masking import PublicMemoLeakError, find_public_leaks
 from angel_memos.materials import (
     Materials,
     load_materials,
@@ -157,6 +158,7 @@ def run_memo_phase(
     append_to_docs: bool = True,
     run_review: bool = True,
     skip_long_memo: bool = False,
+    force_publish: bool = False,
     today: date | None = None,
 ) -> dict[str, Path]:
     """End-to-end Phase B for one company folder.
@@ -239,25 +241,38 @@ def run_memo_phase(
         outputs["xlsx"] = xlsx_path
 
     if append_to_docs:
-        publish_decision_to_docs(folder, config)
+        publish_decision_to_docs(folder, config, force=force_publish)
 
     return outputs
 
 
-def publish_decision_to_docs(folder: Path, config: Config) -> None:
+def publish_decision_to_docs(folder: Path, config: Config, *, force: bool = False) -> None:
     """Publish the cached entries to the Google Docs.
 
     Reads `decision.md`, `private_entry.json`, and (for buys)
     `public_entry.json` from disk and inserts under the appropriate
     container headings.
 
+    For buys, the public entry is scanned for deal-identifying content
+    BEFORE any external write; a surviving company name / founder / exact
+    figure / review marker aborts the entire publish (both docs) unless
+    `force=True`.
+
     Raises:
       FileNotFoundError: cached entry files are missing. Run `memo` first.
+      PublicMemoLeakError: the public entry still leaks deal identity.
     """
     decision = parse_decision(folder / "decision.md")
     private_entry = _load_private_entry(folder)
     is_buy = decision.verdict in {Verdict.BUY, Verdict.STRONG_BUY}
     container = "Portfolio" if is_buy else "Passed Deals"
+
+    # Gate BEFORE either external write so a leak blocks BOTH docs (and a
+    # retry can't leave the private doc appended while the public leg is
+    # blocked).
+    public_entry = _load_public_entry(folder) if is_buy else None
+    if public_entry is not None and not force:
+        _guard_public_entry(folder, decision, public_entry)
 
     insert_private_entry(
         config.private_doc_id,
@@ -266,13 +281,45 @@ def publish_decision_to_docs(folder: Path, config: Config) -> None:
         entry=private_entry,
     )
 
-    if is_buy:
-        public_entry = _load_public_entry(folder)
+    if public_entry is not None:
         insert_public_entry(
             config.public_doc_id,
             container_heading="Memos",
             entry=public_entry,
         )
+
+
+def _guard_public_entry(
+    folder: Path,
+    decision: Decision,
+    public_entry: PublicDocEntry,
+) -> None:
+    """Raise `PublicMemoLeakError` if the public entry still contains any
+    deal-identifying string. Founder names + the AL company label come from
+    the (cached) AngelList parse."""
+    al_company: str | None = None
+    founders: list[str] = []
+    try:
+        materials = load_materials(folder)
+        angellist = load_or_parse_angellist(folder, materials)
+        al_company = angellist.company
+        founders = list(angellist.founders)
+    except Exception:
+        # If AL metadata can't be loaded we still gate on the decision-derived
+        # identifiers rather than skipping the check.
+        pass
+
+    aliases = [al_company] if al_company and al_company != decision.company else []
+    leaks = find_public_leaks(
+        public_entry.model_dump_json(),
+        company=decision.company,
+        aliases=aliases,
+        founders=founders,
+        check_usd=decision.check_usd,
+        post_money_usd=decision.post_money_usd,
+    )
+    if leaks:
+        raise PublicMemoLeakError(leaks)
 
 
 # ---------------------------------------------------------------------------

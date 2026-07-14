@@ -97,3 +97,78 @@ def test_usd_variants_for_billion_scale() -> None:
     variants = list(all_variants_for(2_500_000_000))
     assert any("B" in v for v in variants)
     assert any("billion" in v for v in variants)
+
+
+def test_usd_variants_include_half_million_word_form() -> None:
+    """The `$X.5 million` word form must be generated (regression: it was
+    missing, so an exact figure like '$12.5 million' slipped the leak check)."""
+    variants = list(all_variants_for(12_500_000))
+    assert "$12.5 million" in variants
+
+
+# ---------------------------------------------------------------------------
+# find_public_leaks — the pre-publish leak gate.
+# ---------------------------------------------------------------------------
+
+from angel_memos.masking import find_public_leaks  # noqa: E402
+
+
+def test_clean_anonymized_entry_has_no_leaks() -> None:
+    text = (
+        '{"category_descriptor": "Video Management Agents", '
+        '"metrics": "low-$XM CARR, sub-$XXM post"}'
+    )
+    leaks = find_public_leaks(
+        text,
+        company="Spot AI",
+        founders=["Rish Gupta", "Tanuj Thapliyal"],
+        check_usd=10_000,
+        post_money_usd=195_000_000,
+    )
+    assert leaks == []
+
+
+def test_leak_gate_catches_company_name_case_insensitive() -> None:
+    leaks = find_public_leaks("We love spot ai as a company.", company="Spot AI")
+    assert any(m.startswith("company:") for m in leaks)
+
+
+def test_leak_gate_catches_concatenated_and_domain_forms() -> None:
+    assert find_public_leaks("Check out SpotAI today.", company="Spot AI")
+    assert find_public_leaks("Visit spotai.com for info.", company="Spot AI")
+
+
+def test_leak_gate_catches_stem_of_suffixed_name() -> None:
+    """'Quaise Energy' -> the bare stem 'Quaise' is still identifying."""
+    leaks = find_public_leaks("Quaise is drilling deep.", company="Quaise Energy")
+    assert any(m.startswith("company:") for m in leaks)
+
+
+def test_leak_gate_catches_founder_surname() -> None:
+    leaks = find_public_leaks(
+        "The CEO, previously at Google, leads the team. Thapliyal is technical.",
+        company="Spot AI",
+        founders=["Tanuj Thapliyal"],
+    )
+    assert any("Thapliyal" in m for m in leaks)
+
+
+def test_leak_gate_catches_exact_dollar_figure() -> None:
+    leaks = find_public_leaks(
+        "Post-money is $195 million.", company="Spot AI", post_money_usd=195_000_000
+    )
+    assert any(m.startswith("post_money:") for m in leaks)
+
+
+def test_leak_gate_catches_review_marker() -> None:
+    leaks = find_public_leaks(
+        "[NEEDS BHANU REVIEW: is the moat real?]", company="Spot AI"
+    )
+    assert "review-marker" in leaks
+
+
+def test_leak_gate_ignores_short_company_name_false_positive() -> None:
+    """A 2-char name is too collision-prone to assert on (word-boundary + the
+    3-char floor), so it doesn't fire on unrelated text."""
+    leaks = find_public_leaks("A completely unrelated sentence.", company="Ai")
+    assert leaks == []

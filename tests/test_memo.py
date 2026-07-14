@@ -1,0 +1,105 @@
+"""Memo-phase guards that don't require Claude or Google Docs.
+
+Focus: the pre-publish leak gate (`_guard_public_entry`), which must abort
+before any external write when the anonymized public entry still contains a
+deal-identifying string.
+"""
+
+from pathlib import Path
+
+import pytest
+
+from angel_memos.doc_entries import (
+    BullCaseSection,
+    KeyMetricsSection,
+    MarketAndOpportunity,
+    PublicDocEntry,
+    TeamSection,
+)
+from angel_memos.masking import PublicMemoLeakError
+from angel_memos.memo import _guard_public_entry
+from angel_memos.models import Conviction, Decision, ValuationMethod, Verdict
+
+
+def _decision() -> Decision:
+    return Decision.model_validate(
+        {
+            "company": "Spot AI",
+            "verdict": Verdict.BUY,
+            "conviction": Conviction.HIGH,
+            "check_usd": 10_000.0,
+            "post_money_usd": 195_000_000.0,
+            "valuation_method": ValuationMethod.CUSTOM,
+            "current_base_metric_usd": None,
+            "scenarios": None,
+            "benchmarks": None,
+            "top_reasons": ["a", "b", "c"],
+            "top_risks": ["x", "y", "z"],
+            "raw_reasoning": "r",
+        }
+    )
+
+
+def _public_entry(**overrides: object) -> PublicDocEntry:
+    base: dict[str, object] = {
+        "category_descriptor": "Video Management Agents",
+        "stage_label": "Series A",
+        "date_label": "July 2026",
+        "what_does_it_do": "Turns CCTV into searchable agents.",
+        "why_is_it_important": "Physical-security teams are understaffed.",
+        "market_and_opportunity": MarketAndOpportunity(
+            job_to_be_done="Monitor sites without more headcount.",
+            market_size="$XXB physical security market.",
+            why_now="Vision models finally cheap enough.",
+        ),
+        "team": TeamSection(
+            founder_market_fit="Founders shipped vision infra at scale.",
+            superpower_or_execution_advantage="Distribution via installers.",
+        ),
+        "key_metrics": KeyMetricsSection(
+            arr_or_contracted_revenue="mid-$XM CARR",
+            retention="NDR >120%",
+            efficiency_or_techno_economics="sub-$XXM post",
+        ),
+        "anti_thesis_paragraphs": [
+            "Commoditization of vision models compresses the moat.",
+            "Enterprise sales cycles could stall the burn math.",
+        ],
+        "bull_case": BullCaseSection(
+            thesis="Workflow lock-in compounds with each install.",
+            verdict="GO. Entry price is defensible on CARR multiple.",
+        ),
+    }
+    base.update(overrides)
+    return PublicDocEntry.model_validate(base)
+
+
+def test_guard_passes_on_clean_entry(tmp_path: Path) -> None:
+    # Empty folder -> AL metadata can't load; gate falls back to decision facts.
+    _guard_public_entry(tmp_path, _decision(), _public_entry())
+
+
+def test_guard_raises_on_company_name_leak(tmp_path: Path) -> None:
+    entry = _public_entry(what_does_it_do="Spot AI turns CCTV into agents.")
+    with pytest.raises(PublicMemoLeakError):
+        _guard_public_entry(tmp_path, _decision(), entry)
+
+
+def test_guard_raises_on_exact_figure_leak(tmp_path: Path) -> None:
+    entry = _public_entry(
+        market_and_opportunity=MarketAndOpportunity(
+            job_to_be_done="x",
+            market_size="Post-money was $195 million.",
+            why_now="y",
+        )
+    )
+    with pytest.raises(PublicMemoLeakError):
+        _guard_public_entry(tmp_path, _decision(), entry)
+
+
+def test_guard_raises_on_review_marker(tmp_path: Path) -> None:
+    entry = _public_entry(
+        why_is_it_important="[NEEDS BHANU REVIEW: confirm the moat] It matters."
+    )
+    with pytest.raises(PublicMemoLeakError):
+        _guard_public_entry(tmp_path, _decision(), entry)
