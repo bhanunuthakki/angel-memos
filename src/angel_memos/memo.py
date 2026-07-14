@@ -25,6 +25,8 @@ re-running the heavy Claude calls.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -60,6 +62,15 @@ from angel_memos.pdf_utils import rasterize_pdf
 
 _PRIVATE_ENTRY_FILENAME = "private_entry.json"
 _PUBLIC_ENTRY_FILENAME = "public_entry.json"
+# Records the decision.md hash the cached entries were generated from, so
+# `publish` can refuse to push entries that no longer match a since-edited
+# decision (a buy->pass flip would otherwise publish contradictory content).
+_ENTRY_META_FILENAME = ".entry_meta.json"
+
+
+class StaleEntryError(RuntimeError):
+    """Raised when cached entry JSONs were generated from a different
+    decision.md than the one now on disk. Re-run `memo`, or `--force`."""
 
 _MEMO_SYSTEM_PROMPT = """You are a senior investment analyst writing a 2-3 page
 adversarial bull/bear investment memo for an angel-stage private company.
@@ -189,6 +200,13 @@ def run_memo_phase(
         raise FileNotFoundError(f"decision.md not found in {folder}. Run /angel-decide first.")
     decision = parse_decision(decision_path)
 
+    # Auth preflight: if we're going to publish, verify credentials NOW so a
+    # headless/unauthorized run fails fast instead of after ~$1 of Claude work.
+    if append_to_docs:
+        from angel_memos.google_docs import ensure_credentials
+
+        ensure_credentials()
+
     materials = load_materials(folder)
     angellist = load_or_parse_angellist(folder, materials)
 
@@ -232,6 +250,11 @@ def run_memo_phase(
         public_md_path.write_text(render_public_entry_markdown(public_entry), encoding="utf-8")
         outputs["public_memo"] = public_md_path
 
+    # Stamp the decision.md hash the entries were generated from, so a later
+    # `publish` can detect a since-edited decision and refuse to publish stale
+    # entries.
+    _write_entry_meta(folder, today)
+
     skip_exit_math = (
         decision.verdict == Verdict.PASS or decision.valuation_method == ValuationMethod.CUSTOM
     )
@@ -266,6 +289,12 @@ def publish_decision_to_docs(folder: Path, config: Config, *, force: bool = Fals
     private_entry = _load_private_entry(folder)
     is_buy = decision.verdict in {Verdict.BUY, Verdict.STRONG_BUY}
     container = "Portfolio" if is_buy else "Passed Deals"
+
+    # Refuse to publish cached entries that were generated from a different
+    # decision.md (unless forced) — otherwise a buy->pass edit silently
+    # publishes contradictory content under headings from the new decision.
+    if not force:
+        _check_entry_freshness(folder)
 
     # Gate BEFORE either external write so a leak blocks BOTH docs (and a
     # retry can't leave the private doc appended while the public leg is
@@ -325,6 +354,35 @@ def _guard_public_entry(
 # ---------------------------------------------------------------------------
 # Internal helpers.
 # ---------------------------------------------------------------------------
+
+
+def _decision_sha(folder: Path) -> str:
+    """SHA-256 of decision.md's bytes — the freshness key for cached entries."""
+    return hashlib.sha256((folder / "decision.md").read_bytes()).hexdigest()
+
+
+def _write_entry_meta(folder: Path, today: date) -> None:
+    meta = {"decision_sha": _decision_sha(folder), "generated_on": today.isoformat()}
+    (folder / _ENTRY_META_FILENAME).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _check_entry_freshness(folder: Path) -> None:
+    """Raise `StaleEntryError` if `.entry_meta.json` records a different
+    decision.md hash than the current file. Silent no-op when the meta is
+    absent (entries predate this check) — can't prove staleness, so allow."""
+    meta_path = folder / _ENTRY_META_FILENAME
+    if not meta_path.is_file():
+        return
+    try:
+        recorded = json.loads(meta_path.read_text(encoding="utf-8")).get("decision_sha")
+    except (json.JSONDecodeError, OSError):
+        return
+    if recorded and recorded != _decision_sha(folder):
+        raise StaleEntryError(
+            f"decision.md in {folder} changed since the cached entries were "
+            f"generated. Re-run `angel-memos memo` to regenerate them, or pass "
+            f"--force to publish the stale entries anyway."
+        )
 
 
 def _load_private_entry(folder: Path) -> PrivateDocEntry:

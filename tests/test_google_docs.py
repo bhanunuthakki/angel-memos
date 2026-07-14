@@ -23,6 +23,8 @@ from angel_memos.google_docs import (
     _build_public_blocks,
     _compose_blocks,
     _find_container_heading_end,
+    _heading_exists,
+    _is_noninteractive,
     _merge_adjacent_ranges,
 )
 from angel_memos.models import (
@@ -373,3 +375,44 @@ def test_find_container_ignores_text_at_wrong_level() -> None:
     doc = _fake_doc(("Memos", "HEADING_2", 42))
     with pytest.raises(GoogleDocsStructureError):
         _find_container_heading_end(doc, "Memos", level=3)
+
+
+# ---------------------------------------------------------------------------
+# _heading_exists — idempotency guard (#2).
+# ---------------------------------------------------------------------------
+
+
+def test_heading_exists_true_for_matching_company_heading() -> None:
+    doc = _fake_doc(
+        ("Portfolio", "HEADING_2", 20),
+        ("Zeno Moto", "HEADING_3", 40),
+    )
+    assert _heading_exists(doc, "Zeno Moto", 3) is True
+
+
+def test_heading_exists_false_when_absent() -> None:
+    doc = _fake_doc(("Portfolio", "HEADING_2", 20))
+    assert _heading_exists(doc, "Zeno Moto", 3) is False
+
+
+def test_heading_exists_respects_level() -> None:
+    """The same text at the wrong heading level is not a duplicate."""
+    doc = _fake_doc(("Zeno Moto", "HEADING_2", 20))
+    assert _heading_exists(doc, "Zeno Moto", 3) is False
+
+
+# ---------------------------------------------------------------------------
+# _is_noninteractive — headless auth guard (#2).
+# ---------------------------------------------------------------------------
+
+
+def test_noninteractive_when_headless_env_set() -> None:
+    assert _is_noninteractive({"ANGEL_MEMOS_HEADLESS": "1"}, stdin_isatty=True) is True
+
+
+def test_noninteractive_when_stdin_not_a_tty() -> None:
+    assert _is_noninteractive({}, stdin_isatty=False) is True
+
+
+def test_interactive_when_tty_and_no_headless_flag() -> None:
+    assert _is_noninteractive({}, stdin_isatty=True) is False

@@ -17,7 +17,12 @@ from angel_memos.doc_entries import (
     TeamSection,
 )
 from angel_memos.masking import PublicMemoLeakError
-from angel_memos.memo import _guard_public_entry
+from angel_memos.memo import (
+    StaleEntryError,
+    _check_entry_freshness,
+    _guard_public_entry,
+    _write_entry_meta,
+)
 from angel_memos.models import Conviction, Decision, ValuationMethod, Verdict
 
 
@@ -103,3 +108,30 @@ def test_guard_raises_on_review_marker(tmp_path: Path) -> None:
     )
     with pytest.raises(PublicMemoLeakError):
         _guard_public_entry(tmp_path, _decision(), entry)
+
+
+# ---------------------------------------------------------------------------
+# Entry-freshness guard (#2): don't publish entries against a changed decision.
+# ---------------------------------------------------------------------------
+
+from datetime import date  # noqa: E402
+
+
+def test_freshness_passes_when_decision_unchanged(tmp_path: Path) -> None:
+    (tmp_path / "decision.md").write_text("company: X\nverdict: buy\n", encoding="utf-8")
+    _write_entry_meta(tmp_path, date(2026, 7, 13))
+    _check_entry_freshness(tmp_path)  # no raise
+
+
+def test_freshness_raises_when_decision_edited(tmp_path: Path) -> None:
+    decision = tmp_path / "decision.md"
+    decision.write_text("company: X\nverdict: buy\n", encoding="utf-8")
+    _write_entry_meta(tmp_path, date(2026, 7, 13))
+    decision.write_text("company: X\nverdict: pass\n", encoding="utf-8")  # flip
+    with pytest.raises(StaleEntryError):
+        _check_entry_freshness(tmp_path)
+
+
+def test_freshness_noop_when_meta_absent(tmp_path: Path) -> None:
+    (tmp_path / "decision.md").write_text("company: X\n", encoding="utf-8")
+    _check_entry_freshness(tmp_path)  # no meta -> can't prove staleness -> allow

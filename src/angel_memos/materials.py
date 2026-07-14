@@ -45,6 +45,7 @@ OUTPUT_FILENAMES: frozenset[str] = frozenset(
         ".comparable_deals_cache.json",
         "private_entry.json",
         "public_entry.json",
+        ".entry_meta.json",
     }
 )
 

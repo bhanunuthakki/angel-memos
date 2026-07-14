@@ -56,13 +56,17 @@ OAuth desktop flow on first use; refresh token cached at
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from angel_memos.config import config_dir
 from angel_memos.doc_entries import (
@@ -119,6 +123,11 @@ class GoogleDocsStructureError(RuntimeError):
     """Raised when the target document doesn't have the expected heading."""
 
 
+class GoogleDocsDuplicateError(RuntimeError):
+    """Raised when an entry with the same heading already exists in the doc,
+    so re-inserting would create a duplicate. Pass `force=True` to override."""
+
+
 # ---------------------------------------------------------------------------
 # Public API: high-level entry inserters.
 # ---------------------------------------------------------------------------
@@ -129,26 +138,50 @@ def insert_private_entry(
     container_heading: str,
     decision: Decision,
     entry: PrivateDocEntry,
+    *,
+    force: bool = False,
 ) -> None:
     """Insert a private-doc entry under the named container (Portfolio or
     Passed Deals). The company heading gets the `[Passed]` prefix for
     non-buys; the second section is labeled "Risks" or "Why Passing?".
+
+    Idempotent: if the company's H3 heading already exists in the doc the
+    insert is refused (`GoogleDocsDuplicateError`) unless `force=True`.
     """
     blocks = _build_private_blocks(decision, entry)
-    insert_blocks_under(doc_id, container_heading, _PRIVATE_CONTAINER_LEVEL, blocks)
+    heading = private_company_heading(decision)
+    insert_blocks_under(
+        doc_id,
+        container_heading,
+        _PRIVATE_CONTAINER_LEVEL,
+        blocks,
+        dedupe_heading=heading,
+        dedupe_level=_PRIVATE_COMPANY_LEVEL,
+        force=force,
+    )
 
 
 def insert_public_entry(
     doc_id: str,
     container_heading: str,
     entry: PublicDocEntry,
+    *,
+    force: bool = False,
 ) -> None:
     """Insert a public-doc entry under the named container (Memos).
 
     Used only for buy/strong_buy decisions; pass entries don't reach the
-    public doc."""
+    public doc. Idempotent on the entry's H4 heading unless `force=True`."""
     blocks = _build_public_blocks(entry)
-    insert_blocks_under(doc_id, container_heading, _PUBLIC_CONTAINER_LEVEL, blocks)
+    insert_blocks_under(
+        doc_id,
+        container_heading,
+        _PUBLIC_CONTAINER_LEVEL,
+        blocks,
+        dedupe_heading=public_entry_heading(entry),
+        dedupe_level=_PUBLIC_COMPANY_LEVEL,
+        force=force,
+    )
 
 
 def insert_blocks_under(
@@ -156,17 +189,62 @@ def insert_blocks_under(
     container_heading: str,
     container_level: int,
     blocks: list[Block],
+    *,
+    dedupe_heading: str | None = None,
+    dedupe_level: int | None = None,
+    force: bool = False,
 ) -> None:
     """Insert `blocks` immediately after the named container heading.
 
+    Concurrency-safe and idempotent:
+      - the read-modify-write is guarded by `writeControl.requiredRevisionId`
+        so a human editing the doc during the get→update window causes a
+        clean retry rather than a misplaced insert;
+      - if `dedupe_heading` already exists at `dedupe_level`, the insert is
+        refused (`GoogleDocsDuplicateError`) unless `force=True`, so a re-run
+        or retry can't stack a duplicate entry.
+
     Raises:
-      GoogleDocsStructureError: the doc has no heading paragraph matching
-        the requested `container_heading` at the expected `container_level`.
+      GoogleDocsStructureError: the container heading is missing.
+      GoogleDocsDuplicateError: an entry with `dedupe_heading` already exists.
     """
     service = build("docs", "v1", credentials=_load_credentials())
-    doc = service.documents().get(documentId=doc_id).execute()
-    insert_at = _find_container_heading_end(doc, container_heading, container_level)
 
+    def _attempt() -> None:
+        doc = service.documents().get(documentId=doc_id).execute()
+        if (
+            not force
+            and dedupe_heading is not None
+            and dedupe_level is not None
+            and _heading_exists(doc, dedupe_heading, dedupe_level)
+        ):
+            raise GoogleDocsDuplicateError(
+                f"An entry titled '{dedupe_heading}' already exists in the doc. "
+                f"Re-running would duplicate it; pass force=True to override."
+            )
+        insert_at = _find_container_heading_end(doc, container_heading, container_level)
+        api_requests = _build_insert_requests(insert_at, blocks)
+        body: dict[str, Any] = {"requests": api_requests}
+        revision_id = doc.get("revisionId")
+        if revision_id:
+            body["writeControl"] = {"requiredRevisionId": revision_id}
+        service.documents().batchUpdate(documentId=doc_id, body=body).execute()
+
+    try:
+        _attempt()
+    except HttpError as exc:
+        # A concurrent edit invalidates the required revision (400/409). Retry
+        # once against the current revision; a duplicate/structure error from
+        # the retry propagates normally.
+        if exc.resp.status in (400, 409):
+            _attempt()
+        else:
+            raise
+
+
+def _build_insert_requests(insert_at: int, blocks: list[Block]) -> list[dict[str, Any]]:
+    """Compose the batchUpdate request list for inserting `blocks` at
+    `insert_at`. Pure given the composed text offsets."""
     text, requests_meta = _compose_blocks(blocks)
     api_requests: list[dict[str, Any]] = [
         {"insertText": {"location": {"index": insert_at}, "text": text}},
@@ -209,8 +287,7 @@ def insert_blocks_under(
                 }
             }
         )
-
-    service.documents().batchUpdate(documentId=doc_id, body={"requests": api_requests}).execute()
+    return api_requests
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +525,41 @@ def _find_container_heading_end(doc: dict[str, Any], text: str, level: int) -> i
     )
 
 
+def _heading_exists(doc: dict[str, Any], text: str, level: int) -> bool:
+    """True if the doc already has a `HEADING_<level>` paragraph whose text
+    equals `text` — used to make entry insertion idempotent."""
+    target_style = f"HEADING_{level}"
+    for elem in doc.get("body", {}).get("content", []):
+        para = elem.get("paragraph")
+        if para is None:
+            continue
+        if para.get("paragraphStyle", {}).get("namedStyleType", "") != target_style:
+            continue
+        para_text = "".join(
+            run.get("textRun", {}).get("content", "") for run in para.get("elements", [])
+        ).strip()
+        if para_text == text:
+            return True
+    return False
+
+
+def _is_noninteractive(env: dict[str, str], stdin_isatty: bool) -> bool:
+    """Whether the browser OAuth flow would have no human to complete it.
+
+    Pure so it can be unit-tested. Treats an explicit `ANGEL_MEMOS_HEADLESS`
+    flag or a non-tty stdin (cron, `watch` daemon, CI) as non-interactive."""
+    if env.get("ANGEL_MEMOS_HEADLESS", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    return not stdin_isatty
+
+
+def ensure_credentials() -> None:
+    """Auth preflight: obtain (and cache) credentials, failing fast with a
+    clear error rather than hanging on a browser prompt mid-run. Call at the
+    start of a publish so headless runs abort before doing expensive work."""
+    _load_credentials()
+
+
 def _load_credentials() -> Credentials:
     """Get a valid `Credentials` instance, prompting the browser flow on
     first run if no cached token exists. Cached token auto-refreshes on
@@ -463,7 +575,16 @@ def _load_credentials() -> Credentials:
         return creds
 
     if creds is not None and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except RefreshError as exc:
+            # A revoked/expired refresh token would otherwise raise a raw
+            # RefreshError mid-run. Surface it as an auth error the caller can
+            # handle (and re-auth interactively).
+            raise GoogleDocsAuthError(
+                f"Cached Google token at {token_path} could not be refreshed "
+                f"({exc}). Delete it and re-run interactively to re-authorize."
+            ) from exc
         token_path.write_text(creds.to_json(), encoding="utf-8")
         return creds
 
@@ -474,6 +595,16 @@ def _load_credentials() -> Credentials:
             "2. Enable the Google Docs API\n"
             "3. Create OAuth client credentials (Desktop app type)\n"
             "4. Download the credentials JSON and save it to the path above"
+        )
+
+    # The browser flow needs a human. In a headless/daemon context there is
+    # nobody to complete it, so fail fast instead of blocking forever on
+    # run_local_server.
+    if _is_noninteractive(dict(os.environ), sys.stdin.isatty()):
+        raise GoogleDocsAuthError(
+            "Google Docs authorization is required but this is a non-interactive "
+            "run (no browser available). Run `angel-memos publish <Company>` once "
+            "from an interactive terminal to authorize, then retry."
         )
 
     flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), _SCOPES)
