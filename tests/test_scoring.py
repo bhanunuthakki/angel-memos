@@ -374,6 +374,23 @@ def test_build_summary_names_strongest_and_weakest_factors() -> None:
     assert "traction_tech" in summary  # weakest (40)
 
 
+def test_build_report_deck_present_defaults_true() -> None:
+    report = build_report("Acme", "quick", _all_factors(), summary="s")
+    assert report.deck_present is True
+
+
+def test_build_report_deckless_flags_and_records() -> None:
+    report = build_report("Acme", "quick", _all_factors(), summary="s", deck_present=False)
+    assert report.deck_present is False
+    assert any("No pitch deck" in f for f in report.red_flags)
+
+
+def test_render_markdown_warns_when_deckless() -> None:
+    report = build_report("Acme", "quick", _all_factors(), summary="s", deck_present=False)
+    md = render_score_markdown(report)
+    assert "WITHOUT a pitch deck" in md
+
+
 def test_render_markdown_marks_contested_factors() -> None:
     factors = _all_factors()
     factors[2] = _factor(

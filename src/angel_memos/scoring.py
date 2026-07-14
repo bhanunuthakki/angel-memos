@@ -126,6 +126,10 @@ class ScoreReport(BaseModel):
     red_flags: list[str] = []
     summary: str = Field(min_length=1)
     generated_on: date
+    # False when no pitch deck was present at scoring time — the market and
+    # traction/tech judges then reason from AL terms alone, so the score is
+    # materially lower-confidence. Defaults True so pre-existing reports load.
+    deck_present: bool = True
 
     @model_validator(mode="after")
     def _weights_sum_to_one(self) -> Self:
@@ -295,11 +299,14 @@ def build_report(
     *,
     summary: str,
     generated_on: date | None = None,
+    deck_present: bool = True,
 ) -> ScoreReport:
     """Assemble the scorecard: compute total and band, aggregate red flags."""
     factor_list = list(factors)
     total = aggregate_total(factor_list)
     flags: list[str] = []
+    if not deck_present:
+        flags.append("No pitch deck at scoring time — market/traction judged from AL terms only.")
     for factor in factor_list:
         for flag in factor.red_flags:
             if flag not in flags:
@@ -307,6 +314,7 @@ def build_report(
     return ScoreReport(
         company=company,
         tier=tier,
+        deck_present=deck_present,
         factors=factor_list,
         total=total,
         band=band_for(total),
@@ -688,7 +696,13 @@ def run_score_phase(folder: Path, *, investor_db_path: Path | None = None) -> di
         ),
     ]
 
-    report = build_report(al.company, tier, factors, summary=build_summary(factors))
+    report = build_report(
+        al.company,
+        tier,
+        factors,
+        summary=build_summary(factors),
+        deck_present=materials.deck is not None,
+    )
     json_path = folder / SCORE_JSON_FILENAME
     md_path = folder / SCORE_MD_FILENAME
     json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
@@ -717,6 +731,16 @@ def render_score_markdown(report: ScoreReport) -> str:
         "",
         f"_{report.summary}_",
         "",
+        *(
+            []
+            if report.deck_present
+            else [
+                "> ⚠ **Scored WITHOUT a pitch deck** — market and traction/tech "
+                "were judged from AngelList terms alone. Treat as low-confidence "
+                "and re-score once the deck is captured.",
+                "",
+            ]
+        ),
         f"Generated {report.generated_on.isoformat()}. Advisory only — the "
         "score informs /angel-decide; it does not decide.",
         "",

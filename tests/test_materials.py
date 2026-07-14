@@ -6,12 +6,22 @@ from pathlib import Path
 
 import pytest
 
+from pydantic import BaseModel
+
 from angel_memos.materials import (
     OUTPUT_FILENAMES,
+    FileEntry,
     MaterialsError,
+    _read_fingerprinted_cache,
+    _source_fingerprint,
+    _write_fingerprinted_cache,
     load_materials,
     read_text,
 )
+
+
+class _Toy(BaseModel):
+    value: str
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SPOTAI_AL_PDF = FIXTURES / "spotai_al.pdf"
@@ -91,11 +101,22 @@ def test_load_materials_rejects_missing_angellist(tmp_path: Path) -> None:
         load_materials(tmp_path)
 
 
-def test_load_materials_rejects_multiple_angellist(tmp_path: Path) -> None:
-    _stub_pdf(tmp_path / "angellist_a.pdf")
-    _stub_pdf(tmp_path / "angellist_b.pdf")
-    with pytest.raises(MaterialsError, match="multiple"):
-        load_materials(tmp_path)
+def test_load_materials_prefers_newest_angellist_over_failing(tmp_path: Path) -> None:
+    """A re-capture leaves a second angellist*.pdf. Rather than hard-fail every
+    downstream phase (the old behavior), load_materials picks the newest."""
+    import os
+    import time
+
+    old = tmp_path / "angellist_a.pdf"
+    new = tmp_path / "angellist_b.pdf"
+    _stub_pdf(old)
+    _stub_pdf(new)
+    # Make 'new' unambiguously newer regardless of filesystem mtime ordering.
+    past = time.time() - 1000
+    os.utime(old, (past, past))
+
+    m = load_materials(tmp_path)  # no raise
+    assert m.angellist.path.name == "angellist_b.pdf"
 
 
 def test_load_materials_rejects_missing_folder(tmp_path: Path) -> None:
@@ -112,3 +133,53 @@ def test_load_materials_classifies_spotai_naming_pattern(tmp_path: Path) -> None
     m = load_materials(tmp_path)
     assert m.angellist.kind == "angellist"
     assert m.angellist.path.name == "SpotAI AL Details.pdf"
+
+
+# ---------------------------------------------------------------------------
+# Fingerprinted parse caches (#5/#7): invalidate when source files change.
+# ---------------------------------------------------------------------------
+
+
+def _entry(path: Path) -> FileEntry:
+    _stub_pdf(path)
+    return FileEntry(path=path, kind="angellist")
+
+
+def test_cache_roundtrips_when_fingerprint_matches(tmp_path: Path) -> None:
+    cache = tmp_path / ".cache.json"
+    al = _entry(tmp_path / "al.pdf")
+    fp = _source_fingerprint(al, None)
+    _write_fingerprinted_cache(cache, _Toy(value="hi"), fp)
+    got = _read_fingerprinted_cache(cache, _Toy, fp, legacy_ok=False)
+    assert got is not None and got.value == "hi"
+
+
+def test_cache_invalidates_when_deck_appears(tmp_path: Path) -> None:
+    """AL cache written with no deck must be discarded once a deck exists."""
+    cache = tmp_path / ".cache.json"
+    al = _entry(tmp_path / "al.pdf")
+    _write_fingerprinted_cache(cache, _Toy(value="hi"), _source_fingerprint(al, None))
+    deck = _entry(tmp_path / "deck.pdf")
+    fp_with_deck = _source_fingerprint(al, deck)
+    assert _read_fingerprinted_cache(cache, _Toy, fp_with_deck, legacy_ok=False) is None
+
+
+def test_cache_invalidates_when_source_size_changes(tmp_path: Path) -> None:
+    cache = tmp_path / ".cache.json"
+    al = _entry(tmp_path / "al.pdf")
+    _write_fingerprinted_cache(cache, _Toy(value="hi"), _source_fingerprint(al, None))
+    (tmp_path / "al.pdf").write_bytes(b"%PDF-1.4\n%much bigger content now\n")
+    new_fp = _source_fingerprint(FileEntry(path=tmp_path / "al.pdf", kind="angellist"), None)
+    assert _read_fingerprinted_cache(cache, _Toy, new_fp, legacy_ok=False) is None
+
+
+def test_legacy_bare_cache_accepted_only_when_allowed(tmp_path: Path) -> None:
+    cache = tmp_path / ".cache.json"
+    cache.write_text(_Toy(value="legacy").model_dump_json(), encoding="utf-8")
+    al = _entry(tmp_path / "al.pdf")
+    fp = _source_fingerprint(al, None)
+    # legacy_ok=False (a deck is present now) -> re-parse
+    assert _read_fingerprinted_cache(cache, _Toy, fp, legacy_ok=False) is None
+    # legacy_ok=True (no deck) -> keep the legacy cache
+    kept = _read_fingerprinted_cache(cache, _Toy, fp, legacy_ok=True)
+    assert kept is not None and kept.value == "legacy"
