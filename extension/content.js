@@ -1,22 +1,36 @@
 // Angel Memos Capture — content script.
-// Injects a floating panel on AngelList pages. Captures ONLY the two things
-// the diligence pipeline needs into Downloads/angel-memos/<Company>/:
-//   1. the AL memo   — the deal page itself, printed to PDF by the background;
-//   2. the deck      — the ONE document row whose name is the pitch deck.
+// Captures exactly TWO artifacts into Downloads/angel-memos/<Company>/:
+//   1. AL memo — the deal page printed to PDF (panel hidden during print);
+//   2. Deck    — the one dataroom row named like a pitch deck.
+// Everything else in the dataroom (closing docs, disclaimers) is ignored.
 //
-// Everything else in the dataroom (closing documents, disclaimers, etc.) is
-// deliberately IGNORED. The deck is usually view-only (a clickable table cell
-// with no download button), while the junk docs are the ones that DO have
-// download buttons — so "download every button" grabbed exactly the wrong set.
-// We instead find the deck row by name and either click its download control
-// or open its viewer so the background can print it, like the AL memo.
+// Deck mechanics (verified against a live dataroom): the deck row is usually
+// VIEW-ONLY — a clickable <td> with no download control. Clicking it opens an
+// in-page PSPDFKit overlay, and the page fetches the actual PDF from a signed
+// S3 URL. That fetch shows up in resource timing, so we click the deck, poll
+// performance entries for the document URL, and hand it to the background to
+// download (chrome.downloads needs no CORS). Rows WITH download buttons are
+// the junk docs — never clicked.
+//
+// Capture phases (each a message to the background):
+//   am-arm        arm the download-router for this company
+//   am-print-page print the deal page (panel hidden here — fixes panel-in-PDF)
+//   am-deck-url   download the deck's signed S3 URL as "<Company> deck.pdf"
+//   am-finalize   wait for downloads to settle, write job.json LAST
 
 (() => {
   if (document.getElementById("angel-memos-panel")) return;
 
   const PANEL_ID = "angel-memos-panel";
   const DECK_RE = /\b(pitch\s*deck|deck|presentation)\b/i;
+  const DOC_FETCH_TIMEOUT_MS = 15000; // deck PDF fetch must appear within this
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Belt-and-braces: even if the panel were visible during a print, print
+  // media excludes it.
+  const printCss = document.createElement("style");
+  printCss.textContent = `@media print { #${PANEL_ID} { display: none !important; } }`;
+  document.documentElement.appendChild(printCss);
 
   // Never let the UI hang: if the worker dies mid-capture the message port
   // closes (surfaced as lastError), and as a backstop we also time out.
@@ -74,36 +88,30 @@
     const company = guessCompanyName();
     const confirmed = window.prompt("Company folder name:", company);
     if (!confirmed) return;
+    const companyName = confirmed.trim();
 
-    // Step 1: arm the router BEFORE any deck download/viewer can fire.
+    // Phase 0: arm the router before anything can download.
     setStatus("Arming…");
     const ack = await send({
-      kind: "am-arm", company: confirmed.trim(), tier, sourceUrl: location.href,
+      kind: "am-arm", company: companyName, tier, sourceUrl: location.href,
     });
     if (!ack.ok) { setStatus("Error arming: " + ack.error); return; }
 
-    // Step 2: act ONLY on the deck. Returns { mode, urls }.
-    const deck = captureDeck();
-    if (deck.mode === "none") {
-      setStatus("Capturing page (no deck found)…");
-    } else if (deck.mode === "view") {
-      setStatus("Opening deck…");
-    } else {
-      setStatus("Downloading deck…");
-    }
+    // Phase 1: print the AL memo with the panel hidden and BEFORE the deck
+    // overlay opens, so the memo PDF shows neither.
+    panel.style.display = "none";
+    const printed = await send({ kind: "am-print-page" }, 30000);
+    panel.style.display = "";
+    setStatus(printed.ok ? "Memo saved. Deck…" : "Memo print failed. Deck…");
 
-    // Step 3: if the deck is view-only, give the viewer a moment and also try
-    // to grab an in-page embedded PDF source (some viewers render an <iframe>).
-    let attachments = deck.urls;
-    if (deck.mode === "view") {
-      await sleep(1800);
-      attachments = [...attachments, ...collectEmbeddedPdfSrcs()];
-    }
+    // Phase 2: the deck, and only the deck.
+    const deckResult = await captureDeck(companyName);
+    setStatus(deckResult.note);
 
-    // Step 4: background prints the deal page (+ any deck viewer tab), downloads
-    // the deck url(s), waits for everything to settle, then writes job.json LAST.
-    const reply = await send({ kind: "am-run", attachments, deckMode: deck.mode });
-    setStatus(reply.ok ? `Saved ${reply.count} file(s) ✓` : "Failed: " + reply.error);
+    // Phase 3: finalize — background waits for downloads, writes job.json LAST.
+    const reply = await send({ kind: "am-finalize" });
+    const deckSuffix = deckResult.gotDeck ? "" : " (NO DECK — see console)";
+    setStatus(reply.ok ? `Saved ${reply.count} file(s) ✓${deckSuffix}` : "Failed: " + reply.error);
   }
 
   panel.append(
@@ -114,46 +122,54 @@
   );
   document.documentElement.appendChild(panel);
 
-  function guessCompanyName() {
-    const h1 = document.querySelector("h1");
-    if (h1 && h1.textContent.trim()) return cleanup(h1.textContent);
-    return cleanup(document.title.split(/[|\-–—]/)[0]);
-  }
+  // ---------------------------------------------------------------------------
+  // Deck capture.
+  // ---------------------------------------------------------------------------
 
-  function cleanup(text) {
-    return text.replace(/\s+/g, " ").trim().slice(0, 80);
-  }
-
-  // Capture ONLY the deck. Datarooms render documents in a <table>: the deck is
-  // the row whose name matches DECK_RE. If that row has a download control we
-  // click it (the background router files it into the folder); if it's
-  // view-only (a clickable cell, no button) we click it to open the viewer so
-  // the background prints it. Non-table pages fall back to a deck-named
-  // link/button. Returns { mode: 'download'|'view'|'none', urls: string[] }.
-  function captureDeck() {
+  async function captureDeck(companyName) {
     const cell = findDeckCell();
-    if (cell) {
-      const row = cell.closest("tr") || cell.parentElement;
-      const dl =
-        row &&
-        row.querySelector('button[aria-label="Download" i], a[download], a[href$=".pdf" i]');
-      if (dl) {
-        dl.click();
-        return { mode: "download", urls: [] };
-      }
-      // View-only deck cell (cursor:pointer, no download control).
-      cell.click();
-      return { mode: "view", urls: [] };
+    const control = cell || findDeckControl();
+    if (!control) {
+      console.warn("[angel-memos] no deck row/control found on this page");
+      return { gotDeck: false, note: "No deck found…" };
     }
-    // Fallback for non-dataroom pages: a deck-named link or control.
-    const ctrl = findDeckControl();
-    if (!ctrl) return { mode: "none", urls: [] };
-    const href = ctrl.getAttribute && ctrl.getAttribute("href");
-    if (href && /^https?:/i.test(href) && /\.pdf(\?|$)/i.test(href)) {
-      return { mode: "download", urls: [href] }; // background downloads it
+
+    // If the deck's own row has a download control, use it (router files it).
+    const row = control.closest ? control.closest("tr") : null;
+    const dl =
+      row &&
+      row.querySelector('button[aria-label="Download" i], a[download], a[href$=".pdf" i]');
+    if (dl) {
+      dl.click();
+      return { gotDeck: true, note: "Downloading deck…" };
     }
-    ctrl.click();
-    return { mode: "view", urls: [] };
+
+    // View-only deck: click it open, then watch resource timing for the
+    // document fetch (a non-image fetch from S3/AngelList file storage).
+    setStatus("Opening deck…");
+    performance.setResourceTimingBufferSize(4000);
+    const sinceTs = performance.now();
+    control.click();
+
+    const url = await pollForDeckDocUrl(sinceTs);
+    closeDeckOverlay();
+    if (!url) {
+      console.warn(
+        "[angel-memos] deck viewer opened but no document fetch appeared in " +
+          "resource timing within " + DOC_FETCH_TIMEOUT_MS + "ms — deck not captured"
+      );
+      return { gotDeck: false, note: "Deck URL not found…" };
+    }
+    const saved = await send({
+      kind: "am-deck-url",
+      url,
+      name: `${companyName} deck.pdf`,
+    });
+    if (!saved.ok) {
+      console.warn("[angel-memos] deck download failed:", saved.error);
+      return { gotDeck: false, note: "Deck download failed…" };
+    }
+    return { gotDeck: true, note: "Deck saved…" };
   }
 
   // The deck's document-name cell: a short <td> whose text names a deck.
@@ -167,7 +183,7 @@
   }
 
   // Non-table fallback: a deck-named <a>/<button>/[role=button], shortest label
-  // first (so we click the deck control, not a container mentioning "deck").
+  // first (so we hit the deck control, not a container mentioning "deck").
   function findDeckControl() {
     const inPanel = (el) => el.closest && el.closest("#" + PANEL_ID);
     const isDeck = (el) => {
@@ -181,18 +197,72 @@
     return candidates[0] || null;
   }
 
-  // In-page embedded PDF viewer: an <iframe>/<embed>/<object> whose source is an
-  // https PDF/document URL (blob: sources are context-scoped and can't be
-  // fetched by the background — those fall to the viewer-tab print path).
-  function collectEmbeddedPdfSrcs() {
-    const urls = new Set();
-    for (const el of document.querySelectorAll("iframe[src], embed[src], object[data]")) {
-      const src = el.getAttribute("src") || el.getAttribute("data") || "";
-      if (!/^https?:/i.test(src)) continue;
-      if (/\.pdf(\?|$)/i.test(src) || /document|attachment|dataroom|file/i.test(src)) {
-        urls.add(src);
+  // The deck document is fetched (by PSPDFKit's loader in the top document)
+  // from file storage — observed shape: a `fetch` to an S3 bucket with a UUID
+  // path and no file extension, signed via query string. Poll for the first
+  // such entry that appeared after the deck click.
+  function pollForDeckDocUrl(sinceTs) {
+    const deadline = performance.now() + DOC_FETCH_TIMEOUT_MS;
+    const isImageOrAsset = (pathname) =>
+      /\.(png|jpe?g|gif|webp|svg|ico|css|js|woff2?|mp4)([?#]|$)/i.test(pathname);
+    const check = () => {
+      const entries = performance.getEntriesByType("resource");
+      const candidates = entries.filter((e) => {
+        if (e.startTime < sinceTs - 1000) return false;
+        if (e.initiatorType !== "fetch" && e.initiatorType !== "xmlhttprequest") return false;
+        let u;
+        try {
+          u = new URL(e.name);
+        } catch {
+          return false;
+        }
+        const fileHost =
+          /\.amazonaws\.com$/i.test(u.hostname) || /cloudfront\.net$/i.test(u.hostname);
+        return fileHost && !isImageOrAsset(u.pathname);
+      });
+      return candidates.length ? candidates[candidates.length - 1].name : null;
+    };
+    return new Promise((resolve) => {
+      const tick = () => {
+        const url = check();
+        if (url) return resolve(url);
+        if (performance.now() > deadline) return resolve(null);
+        setTimeout(tick, 400);
+      };
+      setTimeout(tick, 600);
+    });
+  }
+
+  // Close the PSPDFKit overlay so the page is back to normal after capture.
+  function closeDeckOverlay() {
+    const overlays = [...document.querySelectorAll("div")].filter((d) => {
+      const s = getComputedStyle(d);
+      return (
+        s.position === "fixed" && parseInt(s.zIndex || "0", 10) > 100 &&
+        d.offsetHeight > 300 && d.id !== PANEL_ID
+      );
+    });
+    for (const overlay of overlays) {
+      const close = overlay.querySelector(
+        'button[aria-label*="close" i], [role="button"][aria-label*="close" i]'
+      );
+      if (close) {
+        close.click();
+        return;
       }
     }
-    return [...urls];
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true })
+    );
+  }
+
+  function guessCompanyName() {
+    const h1 = document.querySelector("h1");
+    if (h1 && h1.textContent.trim()) return cleanup(h1.textContent);
+    return cleanup(document.title.split(/[|\-–—]/)[0]);
+  }
+
+  function cleanup(text) {
+    return text.replace(/\s+/g, " ").trim().slice(0, 80);
   }
 })();

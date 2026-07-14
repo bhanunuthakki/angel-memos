@@ -14,31 +14,32 @@ Capture writes **only two things** into `Downloads/angel-memos/<Company>/` —
 the memo and the deck. Everything else in the dataroom (closing documents,
 disclaimers, etc.) is deliberately ignored.
 
-1. **AL memo** — the deal page itself, printed to PDF
-   (`angellist - <Company>.pdf`) via Chrome's debugger API.
+1. **AL memo** — the deal page printed to PDF (`angellist - <Company>.pdf`)
+   via Chrome's debugger API, with the panel hidden and *before* the deck
+   viewer opens, so neither appears in the print.
 2. **Deck** — the extension finds the *one* dataroom document row whose name
    is the pitch deck (`/deck|pitch|presentation/`) and acts only on it:
-   - if that row has a download control, it clicks it and a background
+   - if that row has a download control, it clicks it and the background
      download-router files the result into the company folder;
-   - if the deck is **view-only** (a clickable table cell with no download
-     button — the common case), it clicks the deck open; when the viewer
-     opens in a new tab the background prints *that* tab to PDF, same as the
-     AL memo. In-page embedded PDF viewers (`<iframe>`/`<embed>` with an
-     https source) are captured by URL.
+   - if the deck is **view-only** (a clickable table cell, no download
+     button — the common case), it clicks the deck open. The in-page
+     PSPDFKit viewer fetches the actual PDF from a signed file-storage URL;
+     the extension picks that URL out of the page's resource timing and the
+     background downloads it directly as `<Company> deck.pdf`, then closes
+     the overlay. A deck that opens in a real new tab is printed from that
+     tab as a fallback.
 3. `job.json` is written **last** — the watcher treats it as the "drop is
    complete" marker, so it lands only after the memo + deck settle.
 
 The junk-document rows (the ones that *do* have download buttons) are never
-clicked, so closing docs and disclaimers no longer come through.
+clicked, so closing docs and disclaimers don't come through.
 
-> **Deck capture is best-effort and needs a live test.** Datarooms vary in
-> how they open the deck (new-tab viewer, embedded `<iframe>`, or a
-> canvas/image renderer with no PDF URL — that last case still can't be
-> auto-captured). After reloading the extension, capture one deal and confirm
-> a deck PDF lands in the folder; if not, open the deck and use the browser's
-> own Print → Save as PDF into the company folder. The service-worker console
-> logs `[angel-memos] capturing "…" (deck: view|download|none)` so you can see
-> which path fired.
+> **If the deck doesn't land:** the panel says "NO DECK" and the reason is in
+> the consoles — the page console (F12 on the deal tab) and the service-worker
+> console ("Inspect views: service worker" on the extension card) both log
+> `[angel-memos] …` lines. A deck rendered from a canvas/image stream with no
+> fetchable document URL still can't be auto-captured; open it and use the
+> browser's Print → Save as PDF into the company folder for that one.
 
 ## Install (load unpacked)
 

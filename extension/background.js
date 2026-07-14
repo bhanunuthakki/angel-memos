@@ -1,39 +1,44 @@
 // Angel Memos Capture — background service worker.
 //
-// Capture flow (driven by content.js):
-//   am-arm  -> arm the download-router + viewer-tab watcher for a company
-//              (must happen BEFORE any page download / viewer tab opens) and
-//              return an ack.
-//   am-run  -> print the deal page to PDF, download anchor attachments +
-//              embedded PDF sources, wait for the dataroom's button-triggered
-//              downloads AND any deck-viewer tab to settle, then write job.json
-//              LAST as the completeness marker.
+// Capture protocol (phases driven by content.js):
+//   am-arm        arm the download-router + viewer-tab watcher for a company
+//   am-print-page print the sender's tab (the AL memo) to PDF and save it
+//   am-deck-url   download the deck's signed file-storage URL as
+//                 "<Company> deck.pdf" (chrome.downloads needs no CORS)
+//   am-finalize   wait for all downloads to settle, write job.json LAST
+//   am-run        legacy single-shot (stale content script) — print + finalize
 //
-// Three capture mechanisms, because datarooms expose documents three ways:
-//   - real <a href> links               -> downloaded directly
-//   - JS download buttons ("Download")  -> clicked by content, caught by the
-//                                          onDeterminingFilename router
-//   - VIEW-ONLY deck (no download)      -> content clicks it open; if it opens
-//                                          in a new tab we print that tab to
-//                                          PDF here, same as the AL memo.
+// Router note: an onDeterminingFilename listener OVERRIDES the filename path
+// passed to chrome.downloads.download() — that's what sent our own files to
+// the Downloads root in v0.2/0.3. So the router must explicitly suggest the
+// full angel-memos/<Company>/ path for OUR downloads too, not just for the
+// page-initiated ones it exists to catch.
 //
 // Chrome extensions can only write under ~/Downloads; the `angel-memos watch`
 // daemon then moves each completed drop into the Drive Evaluation folder.
 
 const ROOT = "angel-memos";
-const QUIET_MS = 3500; // no new download/tab activity for this long => done
-const MIN_RUN_MS = 3000; // never finalize sooner than this after am-run
+const QUIET_MS = 3000; // no new download/tab activity for this long => done
+const MIN_RUN_MS = 2000; // never finalize sooner than this after am-finalize
 const MAX_RUN_MS = 45000; // hard cap so a stuck download/tab can't hang forever
 const PRINT_TIMEOUT_MS = 15000; // debugger print must not hang the capture
+
+// Hosts the deck URL may point at (it comes from page resource timing).
+const DECK_URL_HOSTS = /(\.amazonaws\.com|\.cloudfront\.net|\.angellist\.com|\.angel\.co)$/i;
 
 // In-memory capture state. A capture is a short burst, so keeping this in the
 // (possibly ephemeral) service worker for its duration is fine.
 let active = null;
 // active = {
 //   company, dir, tier, sourceUrl, tabId,
-//   startedAt, lastActivity, buttonsDone,
+//   startedAt, lastActivity, finalizing,
 //   pending:Set<number>, viewerTabs:Set<number>, completed:number
 // }
+
+// Intended paths for downloads WE start: exact-URL map + FIFO fallback (our
+// downloads are awaited sequentially, so FIFO order holds).
+const pendingByUrl = new Map();
+const pendingNameQueue = [];
 
 // --- Download router: registered once, synchronously, at top level. ---------
 
@@ -42,15 +47,26 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     suggest();
     return;
   }
-  // Our own downloads (page/deck PDFs, anchors, job.json) already carry a path.
   if (item.byExtensionId === chrome.runtime.id) {
-    suggest();
+    // OUR download: re-suggest the intended folder path (the listener's very
+    // existence discards the path given to download() — see header note).
+    // Shift the FIFO on EVERY own-download event so it stays aligned with the
+    // push in startDownload; byUrl is the primary match, FIFO the fallback.
+    const queued = pendingNameQueue.shift();
+    const want =
+      pendingByUrl.get(item.url) || pendingByUrl.get(item.finalUrl) || queued;
+    pendingByUrl.delete(item.url);
+    if (item.finalUrl) pendingByUrl.delete(item.finalUrl);
+    const filename =
+      want || `${ROOT}/${active.dir}/${sanitizeFile(basename(item.filename || ""))}`;
+    suggest({ filename, conflictAction: "uniquify" });
     return;
   }
   if (!isAngelListItem(item)) {
     suggest();
     return;
   }
+  // Page-initiated download during a capture (e.g. a deck row's own button).
   const base = sanitizeFile(basename(item.filename || item.url));
   suggest({ filename: `${ROOT}/${active.dir}/${base}`, conflictAction: "uniquify" });
 });
@@ -70,7 +86,9 @@ chrome.downloads.onChanged.addListener((delta) => {
   }
 });
 
-// --- Deck-viewer tab watcher: a tab opened by the capture tab is the deck. --
+// --- Viewer-tab fallback: a tab opened by the capture tab gets printed. ------
+// (The common dataroom deck is an in-page overlay handled via am-deck-url;
+// this path only fires for decks that open in a real new tab.)
 
 chrome.tabs.onCreated.addListener((tab) => {
   if (!active || tab.openerTabId !== active.tabId || tab.id == null) return;
@@ -90,7 +108,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
       filename: `${ROOT}/${active.dir}/${name}`,
     });
   } catch (err) {
-    console.warn("deck viewer print failed:", err);
+    console.warn("[angel-memos] deck viewer print failed:", err);
   } finally {
     try {
       await chrome.tabs.remove(tabId);
@@ -105,30 +123,29 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg) return false;
-  if (msg.kind === "am-arm") {
-    arm(msg, sender.tab)
-      .then(() => sendResponse({ ok: true }))
-      .catch((err) => sendResponse({ ok: false, error: String(err) }));
-    return true;
-  }
-  if (msg.kind === "am-run") {
-    run(msg, sender.tab)
-      .then((count) => sendResponse({ ok: true, count }))
+  const respond = (promise) => {
+    promise
+      .then((value) => sendResponse(Object.assign({ ok: true }, value || {})))
       .catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true; // async sendResponse
+  };
+  switch (msg.kind) {
+    case "am-arm":
+      return respond(arm(msg, sender.tab));
+    case "am-print-page":
+      return respond(printMemo(sender.tab));
+    case "am-deck-url":
+      return respond(downloadDeckUrl(msg));
+    case "am-finalize":
+      return respond(finalize());
+    case "am-run": // stale content script (pre-0.4) — print + finalize
+      console.warn("[angel-memos] legacy am-run — reload the AngelList tab");
+      return respond(
+        printMemo(sender.tab).then(() => finalize())
+      );
+    default:
+      return false;
   }
-  // Legacy shim: a stale content script (from before an extension reload, when
-  // the tab wasn't refreshed) sends the old single-message format. Handle it
-  // so the capture doesn't hang silently. Reload the page to get the new flow.
-  if (msg.kind === "angel-memos-capture") {
-    console.warn("[angel-memos] legacy capture message — reload the tab for full deck capture");
-    arm(msg, sender.tab)
-      .then(() => run({ attachments: msg.attachments || [], docClicks: 0 }, sender.tab))
-      .then((count) => sendResponse({ ok: true, count }))
-      .catch((err) => sendResponse({ ok: false, error: String(err) }));
-    return true;
-  }
-  return false;
 });
 
 async function arm(msg, tab) {
@@ -136,6 +153,8 @@ async function arm(msg, tab) {
   const dir = sanitizeFolder(company);
   if (!dir) throw new Error("empty company name");
   const now = Date.now();
+  pendingByUrl.clear();
+  pendingNameQueue.length = 0;
   active = {
     company,
     dir,
@@ -144,52 +163,43 @@ async function arm(msg, tab) {
     tabId: tab ? tab.id : null,
     startedAt: now,
     lastActivity: now,
-    buttonsDone: false,
     pending: new Set(),
     viewerTabs: new Set(),
     completed: 0,
   };
+  console.log(`[angel-memos] armed for "${company}" -> ${ROOT}/${dir}/`);
 }
 
-async function run(msg, tab) {
+async function printMemo(tab) {
   if (!active) throw new Error("capture not armed");
-  const dir = active.dir;
-  console.log(
-    `[angel-memos] capturing "${active.company}" -> ${dir} ` +
-      `(deck: ${msg.deckMode || "n/a"}, urls: ${(msg.attachments || []).length})`
-  );
+  if (!tab || tab.id == null) throw new Error("no sender tab");
+  const b64 = await withTimeout(printPageToPdf(tab.id), PRINT_TIMEOUT_MS, "page print");
+  await startDownload({
+    url: "data:application/pdf;base64," + b64,
+    filename: `${ROOT}/${active.dir}/angellist - ${active.company}.pdf`,
+  });
+  console.log(`[angel-memos] memo printed for "${active.company}"`);
+}
 
-  // 1. Deal page -> PDF (the AngelList memo/narrative itself). Time-boxed so a
-  //    hung debugger attach (e.g. DevTools open, another debugger attached)
-  //    can never freeze the whole capture.
+async function downloadDeckUrl(msg) {
+  if (!active) throw new Error("capture not armed");
+  const url = String(msg.url || "");
+  let host;
   try {
-    const pdfBase64 = await withTimeout(
-      printPageToPdf(tab.id),
-      PRINT_TIMEOUT_MS,
-      "page print"
-    );
-    await startDownload({
-      url: "data:application/pdf;base64," + pdfBase64,
-      filename: `${ROOT}/${dir}/angellist - ${active.company}.pdf`,
-    });
-  } catch (err) {
-    console.warn("[angel-memos] page PDF failed (continuing):", err);
+    host = new URL(url).hostname;
+  } catch {
+    throw new Error("invalid deck url");
   }
-
-  // 2. Anchor attachments + embedded PDF viewer sources.
-  for (const url of msg.attachments || []) {
-    try {
-      await startDownload({ url, filename: `${ROOT}/${dir}/${basename(url)}` });
-    } catch (err) {
-      console.warn("attachment failed to start:", url, err);
-    }
+  if (!/^https:/i.test(url) || !DECK_URL_HOSTS.test(host)) {
+    throw new Error(`deck url host not allowed: ${host}`);
   }
+  const name = sanitizeFile(msg.name || "deck.pdf");
+  await startDownload({ url, filename: `${ROOT}/${active.dir}/${name}` });
+  console.log(`[angel-memos] deck download started: ${name}`);
+}
 
-  // 3. The dataroom download buttons were clicked by the content script (their
-  //    downloads arrive via the router) and any deck viewer tab is being
-  //    printed by the tab watcher. Wait for everything to settle, then write
-  //    job.json LAST.
-  active.buttonsDone = true;
+async function finalize() {
+  if (!active) throw new Error("capture not armed");
   active.lastActivity = Date.now();
   await waitForQuiescence();
 
@@ -201,32 +211,33 @@ async function run(msg, tab) {
   const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(job, null, 2))));
   await startDownload({
     url: "data:application/json;base64," + encoded,
-    filename: `${ROOT}/${dir}/job.json`,
+    filename: `${ROOT}/${active.dir}/job.json`,
   });
 
   const count = active.completed;
   console.log(`[angel-memos] done "${active.company}": ${count} file(s) saved`);
   active = null;
-  return count;
+  return { count };
 }
 
 // Resolve once no download/tab activity for QUIET_MS with nothing pending and
-// no viewer tab still loading — but never before MIN_RUN_MS (slow dataroom
-// fetches / viewer loads need time) nor after MAX_RUN_MS (stuck-work backstop).
+// no viewer tab still loading — bounded below by MIN_RUN_MS and above by
+// MAX_RUN_MS so a stuck download can never hang the capture.
 function waitForQuiescence() {
+  const startedWaiting = Date.now();
   return new Promise((resolve) => {
     const check = () => {
       if (!active) return resolve();
       const now = Date.now();
-      const sinceRun = now - active.startedAt;
+      const waited = now - startedWaiting;
       const idle = now - active.lastActivity;
-      if (sinceRun > MAX_RUN_MS) return resolve();
+      if (waited > MAX_RUN_MS) return resolve();
       const quiet =
         active.pending.size === 0 && active.viewerTabs.size === 0 && idle > QUIET_MS;
-      if (sinceRun > MIN_RUN_MS && quiet) return resolve();
-      setTimeout(check, 800);
+      if (waited > MIN_RUN_MS && quiet) return resolve();
+      setTimeout(check, 500);
     };
-    setTimeout(check, 800);
+    setTimeout(check, 500);
   });
 }
 
@@ -245,6 +256,12 @@ async function printPageToPdf(tabId) {
 }
 
 function startDownload(options) {
+  // Record the intended path BEFORE starting, so the router can re-suggest it
+  // (see header note about onDeterminingFilename overriding download paths).
+  if (options.filename) {
+    pendingByUrl.set(options.url, options.filename);
+    pendingNameQueue.push(options.filename);
+  }
   return chrome.downloads.download(
     Object.assign({ conflictAction: "uniquify", saveAs: false }, options)
   );
@@ -272,7 +289,7 @@ function withTimeout(promise, ms, label) {
 
 function isAngelListItem(item) {
   const hay = `${item.url || ""} ${item.finalUrl || ""} ${item.referrer || ""}`;
-  return /angellist\.com/i.test(hay);
+  return /angellist\.com|amazonaws\.com/i.test(hay);
 }
 
 function deckFilename(title) {
