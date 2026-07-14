@@ -172,14 +172,53 @@
     return { gotDeck: true, note: "Deck saved…" };
   }
 
-  // The deck's document-name cell: a short <td> whose text names a deck.
-  function findDeckCell() {
-    return (
-      [...document.querySelectorAll("td")].find((td) => {
-        const t = (td.textContent || "").trim();
-        return t.length > 0 && t.length < 45 && DECK_RE.test(t);
-      }) || null
+  // Filenames use underscores/dashes ("GF_Speech_Deck_Final___Apex"), which
+  // defeat \b word boundaries (_ is a word char) — normalize before matching.
+  const normName = (t) => (t || "").replace(/[_\-.]+/g, " ");
+  const isDeckName = (t) => DECK_RE.test(normName(t)) || /\bslides?\b/i.test(normName(t));
+  const isJunkName = (t) =>
+    /\b(closing|disclaimers?|agreements?|subscription|risks?|terms|kyc|wire|side\s*letter)\b/i.test(
+      normName(t)
     );
+
+  // The deck's document-name cell, from the dataroom documents table.
+  // Primary: the row whose name reads deck-ish. Structural fallback: the deck
+  // is the VIEW-ONLY row (no download control) — junk docs are the
+  // downloadable ones — so if exactly one non-junk row lacks a download
+  // control, that's the deck regardless of its filename.
+  function findDeckCell() {
+    const tables = [...document.querySelectorAll("table")].filter((t) =>
+      /document|uploaded/i.test(
+        ((t.querySelector("thead") || t).textContent || "").slice(0, 300)
+      )
+    );
+    const rows = (tables.length ? tables : [document]).flatMap((t) => [
+      ...t.querySelectorAll("tr"),
+    ]);
+    const docs = rows
+      .map((r) => {
+        const nameCell = [...r.querySelectorAll("td")].find(
+          (td) => (td.textContent || "").trim()
+        );
+        const name = nameCell ? nameCell.textContent.trim() : "";
+        const hasDownload = !!r.querySelector(
+          'button[aria-label="Download" i], a[download], a[href$=".pdf" i]'
+        );
+        return { nameCell, name, hasDownload };
+      })
+      .filter((d) => d.nameCell && d.name.length > 0 && d.name.length < 90);
+
+    const byName = docs.find((d) => isDeckName(d.name));
+    if (byName) return byName.nameCell;
+
+    const viewOnly = docs.filter((d) => !d.hasDownload && !isJunkName(d.name));
+    if (viewOnly.length === 1) {
+      console.log(
+        `[angel-memos] deck by structure (view-only row): "${viewOnly[0].name}"`
+      );
+      return viewOnly[0].nameCell;
+    }
+    return null;
   }
 
   // Non-table fallback: a deck-named <a>/<button>/[role=button], shortest label
@@ -188,7 +227,7 @@
     const inPanel = (el) => el.closest && el.closest("#" + PANEL_ID);
     const isDeck = (el) => {
       const label = (el.getAttribute("aria-label") || "") + " " + (el.textContent || "");
-      return DECK_RE.test(label) && (el.textContent || "").trim().length < 40;
+      return isDeckName(label) && (el.textContent || "").trim().length < 60;
     };
     const candidates = [...document.querySelectorAll('a, button, [role="button"]')].filter(
       (el) => !inPanel(el) && isDeck(el)
