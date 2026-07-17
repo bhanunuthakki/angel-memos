@@ -292,6 +292,22 @@ def review(company: str, folder: Path | None) -> None:
 
 
 @main.command()
+@click.option(
+    "--port", type=int, default=8765, show_default=True, help="Localhost port to serve on."
+)
+@click.option("--no-browser", is_flag=True, default=False, help="Do not auto-open the browser.")
+def dashboard(port: int, no_browser: bool) -> None:
+    """Launch the local deal-orchestration dashboard in the browser.
+
+    Per-deal pipeline view (save info → quick brief → diligence & decision →
+    publish): click into every artifact, run each step, and open the Q&A in a
+    Claude Code session. Ctrl+C to stop."""
+    from angel_memos.dashboard import serve
+
+    serve(load_config(), port=port, open_browser=not no_browser)
+
+
+@main.command()
 @click.argument("company")
 @click.option(
     "--folder",
