@@ -15,6 +15,7 @@ only shells out to `uv run angel-memos`, so `uv` must be on your PATH.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import signal
@@ -37,7 +38,9 @@ def load_roots() -> tuple[Path, Path]:
     """Mirror config.py: defaults, overridden by ~/.config/angel-memos/config.toml."""
     eval_root, port_root = _DEFAULT_EVAL, _DEFAULT_PORTFOLIO
     cfg_dir = os.environ.get("ANGEL_MEMOS_CONFIG_DIR")
-    cfg_path = (Path(cfg_dir) if cfg_dir else Path.home() / ".config" / "angel-memos") / "config.toml"
+    cfg_path = (
+        Path(cfg_dir) if cfg_dir else Path.home() / ".config" / "angel-memos"
+    ) / "config.toml"
     if cfg_path.is_file():
         try:
             raw = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
@@ -102,12 +105,27 @@ class App:
         frame = ttk.LabelFrame(self.root, text="Per-company steps  (need a deal selected above)")
         frame.pack(fill="x", padx=10, pady=4)
 
-        self._cmd_row(frame, "Diligence", ["diligence"], needs_company=True,
-                      desc="Phase A — research topics → diligence_topics.html")
-        self._cmd_row(frame, "Score", ["score"], needs_company=True,
-                      desc="Rubric scorecard → score_report.json / .md  (advisory only)")
-        self._cmd_row(frame, "Review", ["review"], needs_company=True,
-                      desc="Adversarial pressure-test of decision.md → decision_review.md")
+        self._cmd_row(
+            frame,
+            "Diligence",
+            ["diligence"],
+            needs_company=True,
+            desc="Phase A — research topics → diligence_topics.html",
+        )
+        self._cmd_row(
+            frame,
+            "Score",
+            ["score"],
+            needs_company=True,
+            desc="Rubric scorecard → score_report.json / .md  (advisory only)",
+        )
+        self._cmd_row(
+            frame,
+            "Review",
+            ["review"],
+            needs_company=True,
+            desc="Adversarial pressure-test of decision.md → decision_review.md",
+        )
 
         # Memo row with its flags.
         memo_wrap = ttk.Frame(frame)
@@ -122,9 +140,9 @@ class App:
             memo_wrap,
             text="Phase B — private + masked-public memos, exit math, append to Google Docs",
         ).grid(row=0, column=1, columnspan=3, sticky="w")
-        ttk.Checkbutton(memo_wrap, text="--no-docs (skip Google Docs)", variable=self.f_no_docs).grid(
-            row=1, column=1, sticky="w", padx=(0, 10)
-        )
+        ttk.Checkbutton(
+            memo_wrap, text="--no-docs (skip Google Docs)", variable=self.f_no_docs
+        ).grid(row=1, column=1, sticky="w", padx=(0, 10))
         ttk.Checkbutton(memo_wrap, text="--no-review", variable=self.f_no_review).grid(
             row=1, column=2, sticky="w", padx=(0, 10)
         )
@@ -132,21 +150,46 @@ class App:
             memo_wrap, text="--skip-long-memo (reuse existing)", variable=self.f_skip_long
         ).grid(row=1, column=3, sticky="w")
 
-        self._cmd_row(frame, "Publish", ["publish"], needs_company=True,
-                      desc="Re-push cached entries to Google Docs (no Claude call)",
-                      confirm="Append this deal's cached entries to your Google Docs?")
+        self._cmd_row(
+            frame,
+            "Publish",
+            ["publish"],
+            needs_company=True,
+            desc="Re-push cached entries to Google Docs (no Claude call)",
+            confirm="Append this deal's cached entries to your Google Docs?",
+        )
 
     def _build_global_section(self) -> None:
         frame = ttk.LabelFrame(self.root, text="Inbox & cross-deal  (no deal needed)")
         frame.pack(fill="x", padx=10, pady=4)
-        self._cmd_row(frame, "Ingest", ["ingest"], needs_company=False,
-                      desc="Move ready extension drops from Downloads → Evaluation/")
-        self._cmd_row(frame, "Watch", ["watch"], needs_company=False,
-                      desc="Daemon: ingest drops + auto-run quick tier. Use Stop to end.")
-        self._cmd_row(frame, "Investors: backfill", ["investors", "backfill"], needs_company=False,
-                      desc="Seed the investor DB from existing deals, then export investors.md")
-        self._cmd_row(frame, "Investors: export", ["investors", "export"], needs_company=False,
-                      desc="Rewrite investors.md next to the Drive roots")
+        self._cmd_row(
+            frame,
+            "Ingest",
+            ["ingest"],
+            needs_company=False,
+            desc="Move ready extension drops from Downloads → Evaluation/",
+        )
+        self._cmd_row(
+            frame,
+            "Watch",
+            ["watch"],
+            needs_company=False,
+            desc="Daemon: ingest drops + auto-run quick tier. Use Stop to end.",
+        )
+        self._cmd_row(
+            frame,
+            "Investors: backfill",
+            ["investors", "backfill"],
+            needs_company=False,
+            desc="Seed the investor DB from existing deals, then export investors.md",
+        )
+        self._cmd_row(
+            frame,
+            "Investors: export",
+            ["investors", "export"],
+            needs_company=False,
+            desc="Rewrite investors.md next to the Drive roots",
+        )
 
     def _cmd_row(
         self,
@@ -161,7 +204,9 @@ class App:
         row = ttk.Frame(parent)
         row.pack(fill="x", padx=6, pady=2)
         btn = ttk.Button(
-            row, text=label, width=14,
+            row,
+            text=label,
+            width=14,
             command=lambda: self._run(args, needs_company=needs_company, confirm=confirm),
         )
         btn.pack(side="left", padx=(0, 8))
@@ -249,10 +294,8 @@ class App:
             return
         pid = self.proc.pid
         # Graceful first (lets `watch` finish its current move via KeyboardInterrupt).
-        try:
+        with contextlib.suppress(Exception):
             self.proc.send_signal(signal.CTRL_BREAK_EVENT)
-        except Exception:
-            pass
         self.root.after(3000, lambda: self._force_kill(pid))
 
     def _force_kill(self, pid: int) -> None:
