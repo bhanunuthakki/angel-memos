@@ -52,11 +52,10 @@ Cross-deal state (outside the folder contract): `~/.angel-memos/investors.db` (s
 
 ## Agent and application model routing
 
-Interactive research follows the global policy: Fable/Sol owns scope,
-synthesis, and final judgment; Sonnet/Terra performs bounded research and
-analysis; Haiku/Luna is limited to mechanical extraction. Keep delegation at
-depth one, use one to three workers, and give the root session sole ownership
-of company-folder writes.
+Interactive research follows the global delegation policy (`AGENTS.md`
+§Session & Agent Model Selection) unchanged. The one repo-specific constraint:
+the root session has sole ownership of company-folder writes — workers never
+touch `decision.md`, memo files, or other company-folder outputs.
 
 Application LLM calls remain separate from interactive agent routing. They use
 the subscription wrapper described in the root `CLAUDE.md` and enter once
