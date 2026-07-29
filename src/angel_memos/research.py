@@ -30,7 +30,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from angel_memos.claude_cli import OPUS_MODEL, extract_structured
+from angel_memos.claude import Purpose, extract_structured
 from angel_memos.models import Stage
 
 PedigreeTier = Literal["S", "A", "B", "C", "D"]
@@ -188,7 +188,7 @@ def profile_founder(founder_name: str, company_name: str) -> FounderProfile:
     return extract_structured(
         prompt,
         FounderProfile,
-        model=OPUS_MODEL,
+        purpose=Purpose.FOUNDER_PROFILE,
         system_prompt=_FOUNDER_PROFILE_SYSTEM_PROMPT,
     )
 
@@ -205,7 +205,7 @@ def find_comparable_deals(
     return extract_structured(
         prompt,
         ComparableDeals,
-        model=OPUS_MODEL,
+        purpose=Purpose.COMPARABLE_DEALS,
         system_prompt=_COMPARABLE_DEALS_SYSTEM_PROMPT,
     )
 

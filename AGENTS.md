@@ -8,11 +8,13 @@ The full pipeline: `extension capture → ingest → quick screen (diligence + s
 
 1. **Python CLI `angel-memos`** (`src/angel_memos/cli.py`):
    - `diligence <company>` → writes `diligence_topics.html` into the company folder.
-   - `score <company>` → rubric scorecard (`scoring.py`): deterministic weighted factors (team pedigree, co-investor grades, terms-vs-comps) + LLM-judge subscores (market, traction/tech) with self-consistency and an adversarial critique pass → `score_report.json` + `score_report.md`. Auto-upgrades to tier=deep when `research_memo.md` exists. ADVISORY — never writes `decision.md`.
+   - `score <company>` → versioned rubric scorecard (`scoring.py`; saved policy in `SCORING_RUBRIC.md`) → `score_report.json` + `score_report.md`. V2.2 is the default comp-free screen; earlier versions remain historical rollback contracts. V2.2 uses one common total with archetype-specific evidence anchors, separate commercial-evidence/defensibility/execution-capital factors, and a 15% co-investor signal. Comparable valuations are neither researched nor weighted during scoring; terms and return benchmarks belong to `/angel-decide` and exit math. Evidence gates constrain the effective band; `--archetype` can override governed auto-classification. Archetype-aware versions use self-consistent LLM judges plus an adversarial critique. Auto-upgrades to tier=deep when `research_memo.md` exists. ADVISORY — never writes `decision.md`.
    - `memo <company>` → reads `decision.md` + materials, writes `memo_private.md`, `memo_public.md`, `exit_math.xlsx`, and appends to two Google Docs.
    - `ingest` / `watch` (`ingest.py`) → move Chrome-extension drops from `~/Downloads/angel-memos/<Company>/` into `Evaluation/<Company>/`; `watch` is the daemon that also auto-runs the quick tier (diligence + score) when the drop's `job.json` says `tier: quick`. The extension writes `job.json` LAST; it is the drop-completeness marker.
    - `investors backfill|export` (`investors.py`) → persistent cross-deal investor DB. SQLite at `~/.angel-memos/investors.db` — deliberately OUTSIDE Drive (Drive sync corrupts sqlite); readable view exported to the Drive root as `investors.md`. Records stale after 180 days; re-researched on next lookup.
-2. **Project-local skills** (`skill/`):
+2. **Project-local skills** (`skill/`). When either workflow matches the task,
+   every runtime reads its `SKILL.md` completely before acting; Claude may
+   auto-load it, while Codex and Gemini follow this rulebook pointer:
    - `angel-decide` — conversational Q&A producing a schema-validated `decision.md`. Reads `score_report.json` and `research_memo.md` as advisory inputs when present. Runs *between* the quick screen and `memo`.
    - `angel-research` — deep-tier research (~30-60 min, launched deliberately). Fable/Sol selects one to three independent workhorse slices from technical diligence, techno-economics, market structure, and moat/incumbent response; a targeted skeptic is used only for unresolved load-bearing claims. The primary session synthesizes `research_memo.md` and re-runs `angel-memos score` at deep tier.
 3. **Five xlsx templates** (`templates/`) — one per valuation method. `memo` populates the appropriate one based on `decision.valuation_method`.
@@ -52,14 +54,16 @@ Cross-deal state (outside the folder contract): `~/.angel-memos/investors.db` (s
 
 ## Agent and application model routing
 
-Interactive research follows the global delegation policy (`AGENTS.md`
-§Session & Agent Model Selection) unchanged. The one repo-specific constraint:
+Interactive research follows
+`C:\Users\Bhanu\.gemini\procedures\agent-operations.md`. The
+repo-specific constraint is:
 the root session has sole ownership of company-folder writes — workers never
 touch `decision.md`, memo files, or other company-folder outputs.
 
 Application LLM calls remain separate from interactive agent routing. They use
-the subscription wrapper described in the root `CLAUDE.md` and enter once
-through `src/angel_memos/claude.py`; downstream code never imports
+the membership transport contract in
+`C:\Users\Bhanu\.gemini\procedures\llm-ops.TRANSPORTS.md` and
+enter once through `src/angel_memos/claude.py`; downstream code never imports
 `anthropic` or `claude_agent_sdk`. Select exact application models by named
 purpose behind that entry point and change a stability pin only with an eval
 showing parity or improvement. Do not encode a transient model roster in this
@@ -79,7 +83,7 @@ file.
 
 ## Testing
 
-- Strict TDD per global `AGENTS.md`. Schemas have their tests; orchestration tests mock the Claude call.
+- Use `C:\Users\Bhanu\.gemini\procedures\code-change.md`. Schemas have their tests; orchestration tests mock the Claude call.
 - Golden fixtures live in `tests/fixtures/`:
   - `SpotAI_AL_Details.pdf` — AngelList parser fixture
   - `SpotAI_Exit_Math.xlsx` — `arr_multiple` template golden output

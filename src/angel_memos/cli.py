@@ -35,7 +35,12 @@ from angel_memos.memo import (
     run_memo_phase,
 )
 from angel_memos.review import run_decision_review
-from angel_memos.scoring import ScoreReport, run_score_phase
+from angel_memos.scoring import (
+    DealArchetype,
+    RubricVersion,
+    ScoreReport,
+    run_score_phase,
+)
 
 
 @click.group()
@@ -136,16 +141,57 @@ def memo(
     default=None,
     help="Override the company folder location (skips name-based resolution).",
 )
-def score(company: str, folder: Path | None) -> None:
+@click.option(
+    "--rubric-version",
+    type=click.Choice([version.value for version in RubricVersion], case_sensitive=False),
+    default=RubricVersion.V2_2.value,
+    show_default=True,
+    help=(
+        "Scoring contract. V2.2 is the comp-free default with 15% "
+        "co-investor weight; v2.1, v2, and v1 remain rollback paths."
+    ),
+)
+@click.option(
+    "--archetype",
+    type=click.Choice(
+        [value.value for value in DealArchetype if value is not DealArchetype.GENERAL],
+        case_sensitive=False,
+    ),
+    default=None,
+    help="Archetype-aware evidence profile. Omit to classify through the governed LLM route.",
+)
+def score(
+    company: str,
+    folder: Path | None,
+    rubric_version: str,
+    archetype: str | None,
+) -> None:
     """Rubric scorecard: deterministic factor model + LLM-judge subscores.
     Writes score_report.json (consumed by /angel-decide) and score_report.md.
     Tier is 'deep' automatically when research_memo.md exists in the folder."""
     cfg = load_config()
     target = _resolve_company_folder(company, folder, cfg)
+    version = RubricVersion(rubric_version)
+    if version is RubricVersion.V1 and archetype is not None:
+        raise click.ClickException("--archetype requires --rubric-version v2, v2.1, or v2.2")
+    selected_archetype = DealArchetype(archetype) if archetype is not None else None
     click.echo(f"Scoring {target}")
-    outputs = run_score_phase(target)
+    outputs = run_score_phase(
+        target,
+        rubric_version=version,
+        archetype=selected_archetype,
+    )
     report = ScoreReport.model_validate_json(outputs["score_json"].read_text(encoding="utf-8"))
     click.echo(f"  Total: {report.total:.0f}/100 ({report.band.value}, {report.tier} tier)")
+    if report.rubric_version in {
+        RubricVersion.V2,
+        RubricVersion.V2_1,
+        RubricVersion.V2_2,
+    }:
+        click.echo(
+            f"  Effective: {(report.effective_band or report.band).value}; "
+            f"coverage {report.score_coverage:.0%}; archetype {report.archetype.value}"
+        )
     for label, path in outputs.items():
         click.echo(f"  {label}: {path}")
 

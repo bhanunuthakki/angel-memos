@@ -10,8 +10,9 @@ On any AngelList page a small panel appears (bottom-right):
   the quick tier (diligence + scorecard) automatically.
 - **Save only** — capture without triggering research.
 
-Capture writes **only two things** into `Downloads/angel-memos/<Company>/` —
-the memo and the deck. Everything else in the dataroom (closing documents,
+Capture writes the **AL memo and, when the deal provides one, the deck** into
+`Downloads/angel-memos/<Company>/`. A missing deck is valid and does not block
+finalization or ingestion. Everything else in the dataroom (closing documents,
 disclaimers, etc.) is deliberately ignored.
 
 1. **AL memo** — the deal page printed to PDF (`angellist - <Company>.pdf`)
@@ -24,10 +25,10 @@ disclaimers, etc.) is deliberately ignored.
    - if the deck is **view-only** (a clickable table cell, no download
      button — the common case), it clicks the deck open. The in-page
      PSPDFKit viewer fetches the actual PDF from a signed file-storage URL;
-     the extension picks that URL out of the page's resource timing and the
-     background downloads it directly as `<Company> deck.pdf`, then closes
-     the overlay. A deck that opens in a real new tab is printed from that
-     tab as a fallback.
+     the extension waits up to 60 seconds for that request, picks the URL out
+     of the page's resource timing, and the background downloads it directly
+     as `<Company> deck.pdf`, then closes the overlay. A deck that opens in a
+     real new tab is printed from that tab as a fallback.
 3. `job.json` is written **last** — the watcher treats it as the "drop is
    complete" marker, so it lands only after the memo + deck settle.
 

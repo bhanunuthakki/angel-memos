@@ -11,7 +11,7 @@ decide whether to iterate on `decision.md` before committing the memo.
 
 from pathlib import Path
 
-from angel_memos.claude_cli import OPUS_MODEL, call_claude
+from angel_memos.claude import Purpose, call_llm
 from angel_memos.deck import parse_deck_content
 from angel_memos.materials import Materials, load_materials, read_text
 from angel_memos.models import AngelListMetadata, Decision, DeckContent
@@ -81,7 +81,11 @@ def run_decision_review(folder: Path) -> Path:
     deck_content = parse_deck_content(deck_path) if deck_path is not None else None
 
     prompt = _build_review_prompt(decision, angellist, deck_content, materials)
-    review_md = call_claude(prompt, model=OPUS_MODEL, timeout_seconds=600)
+    review_md = call_llm(
+        prompt,
+        purpose=Purpose.DECISION_REVIEW,
+        timeout_seconds=600,
+    )
 
     out_path = folder / "decision_review.md"
     out_path.write_text(review_md, encoding="utf-8")

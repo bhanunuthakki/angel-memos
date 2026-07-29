@@ -45,7 +45,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 from pypdf import PdfReader
 
-from angel_memos.claude_cli import OPUS_MODEL, extract_structured
+from angel_memos.claude import Purpose, extract_structured
 from angel_memos.models import AngelListMetadata, Stage
 from angel_memos.pdf_utils import rasterize_pdf
 
@@ -199,9 +199,10 @@ def _extract_terms(al_pages: list[Path]) -> _Terms:
     return extract_structured(
         prompt,
         _Terms,
-        model=OPUS_MODEL,
+        purpose=Purpose.ANGELLIST_TERMS,
         system_prompt=_TERMS_SYSTEM_PROMPT,
         additional_dirs=[parent],
+        image_paths=al_pages,
     )
 
 
@@ -248,7 +249,7 @@ def _extract_founders_from_text(memo_text: str) -> _Founders:
     return extract_structured(
         prompt,
         _Founders,
-        model=OPUS_MODEL,
+        purpose=Purpose.ANGELLIST_FOUNDERS,
         system_prompt=_FOUNDERS_SYSTEM_PROMPT,
     )
 
@@ -281,7 +282,8 @@ def _extract_founders_from_images(
     return extract_structured(
         prompt,
         _Founders,
-        model=OPUS_MODEL,
+        purpose=Purpose.ANGELLIST_FOUNDERS,
         system_prompt=_FOUNDERS_SYSTEM_PROMPT,
         additional_dirs=[parent],
+        image_paths=pages,
     )

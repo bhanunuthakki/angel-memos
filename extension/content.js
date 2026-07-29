@@ -23,7 +23,7 @@
 
   const PANEL_ID = "angel-memos-panel";
   const DECK_RE = /\b(pitch\s*deck|deck|presentation)\b/i;
-  const DOC_FETCH_TIMEOUT_MS = 15000; // deck PDF fetch must appear within this
+  const DOC_FETCH_TIMEOUT_MS = 60000; // large decks may expose their signed URL slowly
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // Belt-and-braces: even if the panel were visible during a print, print

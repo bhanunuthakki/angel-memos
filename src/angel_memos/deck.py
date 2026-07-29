@@ -11,7 +11,7 @@ heavy synthesis calls produce reliably deep output.
 import tempfile
 from pathlib import Path
 
-from angel_memos.claude_cli import OPUS_MODEL, extract_structured
+from angel_memos.claude import Purpose, extract_structured
 from angel_memos.models import DeckContent
 from angel_memos.pdf_utils import rasterize_pdf
 
@@ -73,7 +73,8 @@ def parse_deck_content(deck_pdf: Path) -> DeckContent:
         return extract_structured(
             prompt,
             DeckContent,
-            model=OPUS_MODEL,
+            purpose=Purpose.DECK_EXTRACTION,
             system_prompt=_SYSTEM_PROMPT,
             additional_dirs=[str(tmp_dir)],
+            image_paths=pages,
         )

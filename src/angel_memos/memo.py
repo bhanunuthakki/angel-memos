@@ -33,7 +33,7 @@ from pathlib import Path
 
 import yaml
 
-from angel_memos.claude_cli import OPUS_MODEL, call_claude
+from angel_memos.claude import Purpose, call_llm
 from angel_memos.config import Config, load_config
 from angel_memos.doc_entries import (
     PrivateDocEntry,
@@ -440,7 +440,11 @@ def _generate_long_memo(
 
         last_problem = ""
         for _attempt in range(2):
-            memo_md = call_claude(prompt, model=OPUS_MODEL)
+            memo_md = call_llm(
+                prompt,
+                purpose=Purpose.LONG_MEMO,
+                image_paths=al_pngs + deck_pngs,
+            )
             missing = _validate_long_memo(memo_md)
             if not missing:
                 return memo_md

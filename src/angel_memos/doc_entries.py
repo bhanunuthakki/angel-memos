@@ -27,7 +27,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from angel_memos.claude_cli import OPUS_MODEL, extract_structured
+from angel_memos.claude import Purpose, extract_structured
 from angel_memos.deck import parse_deck_content
 from angel_memos.materials import Materials, read_text
 from angel_memos.models import (
@@ -243,7 +243,7 @@ def generate_private_entry(
     return extract_structured(
         prompt,
         PrivateDocEntry,
-        model=OPUS_MODEL,
+        purpose=Purpose.PRIVATE_DOC_ENTRY,
         system_prompt=system_prompt,
     )
 
@@ -268,7 +268,7 @@ def generate_public_entry(
     return extract_structured(
         prompt,
         PublicDocEntry,
-        model=OPUS_MODEL,
+        purpose=Purpose.PUBLIC_DOC_ENTRY,
         system_prompt=system_prompt,
     )
 

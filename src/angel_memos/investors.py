@@ -192,12 +192,12 @@ def build_grade_prompt(name: str, context: str) -> str:
 def grade_investor(name: str, context: str) -> InvestorResearch:
     """Web-research one investor and return a graded profile.
     ~$0.05 / 30s per call; results persist in the DB for 180 days."""
-    from angel_memos.claude_cli import OPUS_MODEL, extract_structured
+    from angel_memos.claude import Purpose, extract_structured
 
     return extract_structured(
         build_grade_prompt(name, context),
         InvestorResearch,
-        model=OPUS_MODEL,
+        purpose=Purpose.INVESTOR_GRADE,
         system_prompt=_GRADE_SYSTEM_PROMPT,
     )
 

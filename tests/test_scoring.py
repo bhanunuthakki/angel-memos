@@ -3,28 +3,43 @@ band mapping, report assembly, brief building, and markdown rendering.
 LLM-judge calls are injected as plain callables so nothing here touches
 Claude."""
 
+from datetime import date
+from inspect import signature
+
 import pytest
 from pydantic import ValidationError
 
 from angel_memos.models import AngelListMetadata, Stage
 from angel_memos.scoring import (
     DEFAULT_WEIGHTS,
+    V2_1_WEIGHTS,
+    V2_WEIGHTED_COMPS_WEIGHTS,
+    V2_WEIGHTS,
     Confidence,
+    DealArchetype,
     FactorName,
     FactorScore,
     JudgeSample,
+    RubricVersion,
     ScoreBand,
     ScoreReport,
     aggregate_total,
     apply_critique,
     band_for,
+    blend_team_factor,
     build_deal_brief,
     build_report,
+    build_report_v2,
     build_summary,
     coinvestor_score,
     consensus,
+    judge_system_prompt,
+    normalized_total,
     render_score_markdown,
+    rubric_uses_comparable_research,
+    run_score_phase,
     team_score,
+    terms_return_factor,
     valuation_score,
 )
 
@@ -75,7 +90,64 @@ def test_default_weights_sum_to_one() -> None:
 
 
 def test_default_weights_cover_all_factors() -> None:
-    assert set(DEFAULT_WEIGHTS) == set(FactorName)
+    assert set(DEFAULT_WEIGHTS) == {
+        FactorName.TEAM,
+        FactorName.CO_INVESTORS,
+        FactorName.MARKET,
+        FactorName.TRACTION_TECH,
+        FactorName.TERMS_VALUATION,
+    }
+
+
+def test_v2_2_weights_match_decision_rubric_and_sum_to_one() -> None:
+    assert V2_WEIGHTS == {
+        FactorName.TEAM: 0.20,
+        FactorName.MARKET: 0.15,
+        FactorName.COMMERCIAL_EVIDENCE: 0.20,
+        FactorName.DEFENSIBILITY: 0.15,
+        FactorName.EXECUTION_CAPITAL: 0.15,
+        FactorName.CO_INVESTORS: 0.15,
+    }
+    assert FactorName.TERMS_RETURN not in V2_WEIGHTS
+    assert abs(sum(V2_WEIGHTS.values()) - 1.0) < 1e-9
+
+
+def test_comp_free_v2_2_is_the_default_runtime_rubric() -> None:
+    default = signature(run_score_phase).parameters["rubric_version"].default
+
+    assert default is RubricVersion.V2_2
+
+
+def test_v2_1_weights_remain_available_for_historical_reports() -> None:
+    assert V2_1_WEIGHTS == {
+        FactorName.TEAM: 0.20,
+        FactorName.MARKET: 0.15,
+        FactorName.COMMERCIAL_EVIDENCE: 0.25,
+        FactorName.DEFENSIBILITY: 0.20,
+        FactorName.EXECUTION_CAPITAL: 0.15,
+        FactorName.CO_INVESTORS: 0.05,
+    }
+
+
+def test_v2_1_report_still_validates_with_historical_weights() -> None:
+    report = build_report_v2(
+        "Acme",
+        "quick",
+        [_factor(name=name, score=70.0, weight=weight) for name, weight in V2_1_WEIGHTS.items()],
+        archetype=DealArchetype.AI_SOFTWARE,
+        summary="s",
+        rubric_version=RubricVersion.V2_1,
+    )
+
+    assert report.rubric_version is RubricVersion.V2_1
+    assert report.total == pytest.approx(70.0)
+
+
+def test_only_historical_rubrics_load_comparable_research() -> None:
+    assert rubric_uses_comparable_research(RubricVersion.V1) is True
+    assert rubric_uses_comparable_research(RubricVersion.V2) is True
+    assert rubric_uses_comparable_research(RubricVersion.V2_1) is False
+    assert rubric_uses_comparable_research(RubricVersion.V2_2) is False
 
 
 def test_factor_score_rejects_out_of_range() -> None:
@@ -88,6 +160,28 @@ def test_factor_score_rejects_out_of_range() -> None:
 def test_judge_sample_requires_rationale() -> None:
     with pytest.raises(ValidationError):
         JudgeSample.model_validate({"score": 50.0, "rationale": ""})
+
+
+def test_old_score_report_loads_as_v1() -> None:
+    legacy = build_report("Acme", "quick", _all_factors(), summary="s")
+    payload = legacy.model_dump(
+        exclude={
+            "rubric_version",
+            "archetype",
+            "score_coverage",
+            "effective_band",
+            "provisional",
+            "gates",
+        }
+    )
+
+    restored = ScoreReport.model_validate(payload)
+
+    assert restored.rubric_version is RubricVersion.V1
+    assert restored.archetype is DealArchetype.GENERAL
+    assert restored.effective_band is restored.band
+    assert restored.score_coverage == 1.0
+    assert restored.provisional is False
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +210,28 @@ def test_team_score_empty_is_low_confidence_and_weak() -> None:
 def test_team_score_two_founders_high_confidence() -> None:
     _, confidence = team_score(["A", "B"])
     assert confidence is Confidence.HIGH
+
+
+def test_v2_team_blends_pedigree_with_founder_market_fit() -> None:
+    fit = _factor(
+        name=FactorName.TEAM,
+        score=50.0,
+        weight=V2_WEIGHTS[FactorName.TEAM],
+        confidence=Confidence.MEDIUM,
+        rationale="Relevant buyer experience is not yet demonstrated.",
+        method="llm_judge",
+    )
+
+    factor = blend_team_factor(
+        pedigree_score=90.0,
+        pedigree_confidence=Confidence.HIGH,
+        pedigree_rationale="Tier-S repeat founder.",
+        fit_factor=fit,
+    )
+
+    assert factor.score == 70.0
+    assert factor.method == "hybrid"
+    assert "founder-market fit" in factor.rationale.lower()
 
 
 def test_coinvestor_score_orders_grades() -> None:
@@ -153,6 +269,40 @@ def test_valuation_score_no_comps_is_neutral_low_confidence() -> None:
     assert score == 50.0
     assert confidence is Confidence.LOW
     assert "no comparable" in rationale.lower()
+
+
+def test_v2_terms_without_comps_is_not_scored() -> None:
+    factor = terms_return_factor(
+        50_000_000,
+        [],
+        estimated_expenses_pct=0.02,
+        gross_carry_pct=0.20,
+    )
+
+    assert factor.name is FactorName.TERMS_RETURN
+    assert factor.score is None
+    assert factor.confidence is Confidence.LOW
+    assert "not scored" in factor.rationale.lower()
+
+
+def test_v2_terms_score_reflects_carry_and_expense_drag() -> None:
+    direct = terms_return_factor(
+        15_000_000,
+        [20_000_000, 25_000_000, 30_000_000],
+        estimated_expenses_pct=0.0,
+        gross_carry_pct=0.0,
+    )
+    syndicated = terms_return_factor(
+        15_000_000,
+        [20_000_000, 25_000_000, 30_000_000],
+        estimated_expenses_pct=0.02,
+        gross_carry_pct=0.20,
+    )
+
+    assert direct.score is not None
+    assert syndicated.score is not None
+    assert syndicated.score < direct.score
+    assert "5x gross-outcome benchmark" in syndicated.rationale
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +346,24 @@ def test_consensus_unions_red_flags_preserving_order() -> None:
     assert result.red_flags == ["flag a", "flag b", "flag c"]
 
 
+def test_consensus_requires_majority_for_evidence_flags() -> None:
+    samples = [
+        JudgeSample(
+            score=60,
+            rationale="a",
+            material_claim_conflict=True,
+            critical_evidence_missing=True,
+        ),
+        JudgeSample(score=62, rationale="b", material_claim_conflict=True),
+        JudgeSample(score=64, rationale="c"),
+    ]
+
+    result = consensus(samples)
+
+    assert result.material_claim_conflict is True
+    assert result.critical_evidence_missing is False
+
+
 def test_consensus_rejects_empty() -> None:
     with pytest.raises(ValueError):
         consensus([])
@@ -222,6 +390,25 @@ def test_aggregate_total_is_weighted_sum() -> None:
     total = aggregate_total(_all_factors())
     expected = 80 * 0.30 + 60 * 0.15 + 50 * 0.15 + 40 * 0.20 + 55 * 0.20
     assert abs(total - expected) < 1e-9
+
+
+def test_normalized_total_excludes_unscored_weight() -> None:
+    factors = [
+        _factor(name=FactorName.TEAM, score=80.0, weight=0.20),
+        _factor(name=FactorName.MARKET, score=60.0, weight=0.15),
+        _factor(name=FactorName.COMMERCIAL_EVIDENCE, score=70.0, weight=0.20),
+        _factor(name=FactorName.DEFENSIBILITY, score=50.0, weight=0.15),
+        _factor(name=FactorName.EXECUTION_CAPITAL, score=40.0, weight=0.10),
+        _factor(name=FactorName.TERMS_RETURN, score=None, weight=0.15),
+        _factor(name=FactorName.CO_INVESTORS, score=90.0, weight=0.05),
+    ]
+
+    total, coverage = normalized_total(factors)
+
+    assert coverage == pytest.approx(0.85)
+    assert total == pytest.approx(
+        (80 * 0.20 + 60 * 0.15 + 70 * 0.20 + 50 * 0.15 + 40 * 0.10 + 90 * 0.05) / 0.85
+    )
 
 
 def test_band_boundaries() -> None:
@@ -251,6 +438,102 @@ def test_report_json_roundtrip() -> None:
     report = build_report("Acme", "deep", _all_factors(), summary="s")
     restored = ScoreReport.model_validate_json(report.model_dump_json())
     assert restored == report
+
+
+def test_legacy_v2_missing_terms_caps_effective_band_and_marks_provisional() -> None:
+    factors = [
+        _factor(name=name, score=85.0, weight=weight)
+        for name, weight in V2_WEIGHTED_COMPS_WEIGHTS.items()
+        if name is not FactorName.TERMS_RETURN
+    ]
+    factors.append(
+        _factor(
+            name=FactorName.TERMS_RETURN,
+            score=None,
+            weight=V2_WEIGHTED_COMPS_WEIGHTS[FactorName.TERMS_RETURN],
+            confidence=Confidence.LOW,
+            rationale="Not scored: no comparable valuations.",
+        )
+    )
+
+    report = build_report_v2(
+        "Acme",
+        "quick",
+        factors,
+        archetype=DealArchetype.AI_SOFTWARE,
+        summary="s",
+        rubric_version=RubricVersion.V2,
+    )
+
+    assert report.total == pytest.approx(85.0)
+    assert report.band is ScoreBand.STRONG_CANDIDATE
+    assert report.effective_band is ScoreBand.CONSIDER
+    assert report.provisional is True
+    assert report.score_coverage == pytest.approx(0.85)
+    assert any(g.code == "terms_not_scored" for g in report.gates)
+
+
+def test_v2_2_excludes_terms_and_does_not_apply_a_missing_comps_gate() -> None:
+    factors = [_factor(name=name, score=85.0, weight=weight) for name, weight in V2_WEIGHTS.items()]
+
+    report = build_report_v2(
+        "Acme",
+        "quick",
+        factors,
+        archetype=DealArchetype.AI_SOFTWARE,
+        summary="s",
+        rubric_version=RubricVersion.V2_2,
+    )
+
+    assert report.total == pytest.approx(85.0)
+    assert report.band is ScoreBand.STRONG_CANDIDATE
+    assert report.effective_band is ScoreBand.STRONG_CANDIDATE
+    assert report.provisional is False
+    assert report.score_coverage == 1.0
+    assert all(factor.name is not FactorName.TERMS_RETURN for factor in report.factors)
+    assert all(gate.code != "terms_not_scored" for gate in report.gates)
+
+
+def test_v2_material_claim_conflict_caps_commercial_factor() -> None:
+    factors = [_factor(name=name, score=70.0, weight=weight) for name, weight in V2_WEIGHTS.items()]
+    commercial_index = next(
+        i for i, factor in enumerate(factors) if factor.name is FactorName.COMMERCIAL_EVIDENCE
+    )
+    factors[commercial_index] = _factor(
+        name=FactorName.COMMERCIAL_EVIDENCE,
+        score=82.0,
+        weight=V2_WEIGHTS[FactorName.COMMERCIAL_EVIDENCE],
+        material_claim_conflict=True,
+    )
+
+    report = build_report_v2(
+        "Acme",
+        "quick",
+        factors,
+        archetype=DealArchetype.HARDWARE_PRODUCT,
+        summary="s",
+    )
+
+    commercial = next(
+        factor for factor in report.factors if factor.name is FactorName.COMMERCIAL_EVIDENCE
+    )
+    assert commercial.score == 50.0
+    assert any(g.code == "commercial_claim_conflict" for g in report.gates)
+
+
+def test_v2_report_rejects_legacy_factor_contract() -> None:
+    with pytest.raises(ValidationError):
+        ScoreReport(
+            company="Acme",
+            tier="quick",
+            factors=_all_factors(),
+            total=60.0,
+            band=ScoreBand.CONSIDER,
+            summary="s",
+            generated_on=date.today(),
+            rubric_version=RubricVersion.V2,
+            archetype=DealArchetype.AI_SOFTWARE,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -401,3 +684,37 @@ def test_render_markdown_marks_contested_factors() -> None:
     )
     out = render_score_markdown(build_report("Acme", "quick", factors, summary="s"))
     assert "contested" in out.lower()
+
+
+def test_render_v2_2_shows_effective_band_without_terms_factor() -> None:
+    factors = [_factor(name=name, score=70.0, weight=weight) for name, weight in V2_WEIGHTS.items()]
+    report = build_report_v2(
+        "Acme",
+        "quick",
+        factors,
+        archetype=DealArchetype.AI_SOFTWARE,
+        summary="s",
+        rubric_version=RubricVersion.V2_2,
+    )
+
+    out = render_score_markdown(report)
+
+    assert "v2.2" in out
+    assert "AI software" in out
+    assert "terms_return" not in out
+    assert "Effective band" in out
+
+
+def test_archetype_prompts_use_distinct_evidence_anchors() -> None:
+    ai_prompt = judge_system_prompt(
+        FactorName.DEFENSIBILITY,
+        archetype=DealArchetype.AI_SOFTWARE,
+    )
+    hardware_prompt = judge_system_prompt(
+        FactorName.DEFENSIBILITY,
+        archetype=DealArchetype.HARDWARE_PRODUCT,
+    )
+
+    assert "model-provider dependency" in ai_prompt
+    assert "manufacturing process" in hardware_prompt
+    assert ai_prompt != hardware_prompt

@@ -22,7 +22,7 @@ import tempfile
 from html import escape
 from pathlib import Path
 
-from angel_memos.claude_cli import OPUS_MODEL, extract_structured
+from angel_memos.claude import Purpose, extract_structured
 from angel_memos.materials import (
     Materials,
     load_materials,
@@ -261,9 +261,10 @@ def run_diligence(folder: Path) -> DiligenceTopics:
         return extract_structured(
             prompt,
             DiligenceTopics,
-            model=OPUS_MODEL,
+            purpose=Purpose.DILIGENCE_TOPICS,
             system_prompt=_SYSTEM_PROMPT,
             additional_dirs=[str(tmp_dir)],
+            image_paths=al_pngs + deck_pngs,
         )
 
 
