@@ -117,7 +117,7 @@ answerable from:
   - Additional public web search (LinkedIn, Crunchbase, news, Glassdoor
     of founders' PRIOR companies, regulatory filings, court records,
     state procurement portals, public funding coverage)
-  - Sanity-check math on deck-stated numbers (does ARR ÷ customers ÷
+  - Sanity-check math on deck-stated numbers (does ARR / customers /
     months line up? Is the pipeline number consistent with deal count?)
   - Stage / category base rates from publicly-known comparables
 
@@ -183,14 +183,16 @@ THE 9 STANDARD SECTIONS — each gets bull / bear / verdict / kill
      they execute. Bear: specific gap (commercial / technical / domain).
   7. financials — anchor valuation against comps. Bull: why entry price
      is defensible. Bear: specific multiple/ratio that's offside.
+     MANDATORY bullet (bull or bear, wherever it lands): BREAK-EVEN
+     GROWTH — revenue needed at the named comp multiple to justify entry
+     post-money, vs current revenue ("needs 5.0x revenue growth just to
+     return 1x at Symbotic's 10.3x").
   8. scenario_analysis — bull = upside math + probability. Bear = downside
      math + probability. Verdict = probability-weighted call. ALSO populate
-     `scenarios`: 4-5 named outcomes with probability + return_mom (gross
-     multiple-on-money) + a one-line key_assumption. Probabilities must
-     sum to ~1.0. Spread across Zero/Slow Grind/Base/Bull/Generational
-     (or similar) — must show realistic tail risk AND upside, not just
-     a polite Bear/Base/Bull cluster. Be honest about base-rate failure
-     probability for the stage.
+     `scenarios`: 4-5 named outcomes obeying the SCENARIO MATH CONTRACT
+     below. Probabilities must sum to ~1.0. Spread across Zero/Slow
+     Grind/Base/Bull/<regime-change tail> — must show realistic tail risk
+     AND upside, not a polite Bear/Base/Bull cluster.
   9. verdict_and_open_questions — overall call. Verdict is the final
      position. Kill conditions = the 2-3 highest-leverage diligence items.
 
@@ -201,6 +203,44 @@ For EVERY section, populate ALL FOUR fields:
     "PASS UNLESS X", "WATCH WHEN X")
   - kill_conditions: 1-3 falsifiable measurable events that would flip
     the verdict
+
+============================================================================
+SCENARIO MATH CONTRACT — micro-economics only (auto-fail if violated)
+============================================================================
+
+Every scenario's return_mom is DERIVED, never asserted. The chain is:
+  exit revenue x named comp multiple = exit EV; / entry post-money;
+  x dilution retention (rounds implied by burn vs runway vs exit year).
+Write that chain in `derivation` and set `exit_value_usd`.
+
+1. MULTIPLES COME FROM NAMED COMPS — a company in the COMPARABLE DEALS
+   block or a named public comp with its current multiple. Banned:
+   naked multiples ("10x is fair for this space").
+2. TAM BIND: state which cells the sourced TAM constrains. A base case
+   requiring ≥50% of the category TAM is a bear point, not a footnote.
+3. PROBABILITIES FROM EXECUTION GATES: each weight names the company-
+   specific gate that sets it (booked vs pipeline revenue, deployment
+   stage, contract status, next-round dependency). Banned: weights
+   copied from population base rates or asserted without a gate. Base
+   rates appear ONCE, as a closing sanity line in the section verdict
+   ("tail weights sit inside the 4-6% observed >10x rate").
+4. THE TAIL CELL IS A REGIME CHANGE, NOT A BIGGER BASE CASE. Build it
+   first-principles: what economics regime could this company's asset
+   unlock (e.g. absorbing the construction LABOR line, not the layout-
+   tooling line)? Price it as units x displaced cost x plausible
+   capture. Weight it honestly — 1-3% or argued to zero — but it must
+   be constructed and reasoned; comp-anchored ceilings silently
+   truncate exactly the power-law tail angel investing exists for. It
+   REPLACES a generic "Generational" cell; never keep both.
+5. DOWNSIDE CELLS RESPECT THE PREFERENCE STACK: state total preferred
+   sitting ahead of this SPV. Sub-1x cells must reflect seniority — a
+   senior position over a small stack floors near 1x at modest exits; a
+   junior position under a large stack zeros even above total raised.
+6. If the terms summary carries a TERMS PARSE INCOMPLETE warning, the
+   financials verdict MUST open with "NET MATH UNRELIABLE —" and name
+   the missing fields as a kill condition.
+
+============================================================================
 
 `top_priorities` on the top-level DiligenceTopics: 3-5 highest-leverage
 diligence actions across all sections — what to do next, not what to think.
@@ -272,7 +312,13 @@ def run_diligence_phase(folder: Path) -> Path:
     """End-to-end Phase A: run analysis, render HTML, write file.
     Returns the path of the written `diligence_topics.html`."""
     topics = run_diligence(folder)
-    html = render_diligence_html(topics)
+    # The terms-gap banner is rendered deterministically from the parsed
+    # metadata (cache-hit here — run_diligence already parsed it), not
+    # entrusted to the LLM output: a wrong net-return figure must be flagged
+    # even if the synthesis pass ignored contract rule 6.
+    materials = load_materials(folder)
+    gaps = load_or_parse_angellist(folder, materials).terms_gaps()
+    html = render_diligence_html(topics, terms_gaps=gaps)
     out_path = folder / "diligence_topics.html"
     out_path.write_text(html, encoding="utf-8")
     return out_path
@@ -291,11 +337,23 @@ _SECTION_ORDER: list[tuple[str, str]] = [
 ]
 
 
-def render_diligence_html(topics: DiligenceTopics) -> str:
+def render_diligence_html(topics: DiligenceTopics, terms_gaps: list[str] | None = None) -> str:
     """Render `DiligenceTopics` as a standalone HTML document with inline CSS.
     The output is readable in any browser and self-contained (no external
-    dependencies)."""
+    dependencies). A non-empty `terms_gaps` renders a blocking data-gap
+    banner above everything else — net-return math downstream of an
+    incomplete TERMS parse is wrong, not merely uncertain."""
     company_html = escape(topics.company)
+    banner = ""
+    if terms_gaps:
+        gap_list = ", ".join(escape(g) for g in terms_gaps)
+        banner = (
+            '<section class="datagap">\n'
+            "<strong>TERMS PARSE INCOMPLETE</strong> — "
+            f"{gap_list} parsed as 0.0. All net-return and fee math in this "
+            "report is unreliable until the TERMS table is re-captured.\n"
+            "</section>"
+        )
     parts: list[str] = [
         "<!DOCTYPE html>",
         '<html lang="en">',
@@ -306,6 +364,7 @@ def render_diligence_html(topics: DiligenceTopics) -> str:
         "</head>",
         "<body>",
         f"<h1>{company_html} &mdash; Diligence Topics</h1>",
+        banner,
         _render_top_priorities(topics.top_priorities),
     ]
     for attr, heading in _SECTION_ORDER:
@@ -499,19 +558,22 @@ def _render_scenario_chart(scenarios: list[ScenarioOutcome]) -> str:
 
     rows: list[str] = []
     for s in scenarios:
+        exit_ev = f"${s.exit_value_usd / 1e6:,.0f}M" if s.exit_value_usd else "—"
         rows.append(
             f"      <tr>"
             f"<td>{escape(s.name)}</td>"
             f'<td class="num">{s.probability:.0%}</td>'
             f'<td class="num">{_format_mom(s.return_mom)}</td>'
+            f'<td class="num">{exit_ev}</td>'
+            f"<td>{escape(s.derivation)}</td>"
             f"<td>{escape(s.key_assumption)}</td>"
             f"</tr>"
         )
     table = (
         '  <table class="scenarios">\n'
         "    <thead>\n"
-        "      <tr><th>Scenario</th><th>P</th><th>MoM</th>"
-        "<th>Key assumption</th></tr>\n"
+        "      <tr><th>Scenario</th><th>P</th><th>MoM</th><th>Exit EV</th>"
+        "<th>Derivation</th><th>Key assumption</th></tr>\n"
         "    </thead>\n    <tbody>\n" + "\n".join(rows) + "\n    </tbody>\n  </table>"
     )
 
@@ -586,6 +648,13 @@ def _format_prompt(
     )
     if angellist.total_prior_capital_usd is not None:
         al_summary += f"  Total prior capital: ${angellist.total_prior_capital_usd:,.0f}\n"
+    gaps = angellist.terms_gaps()
+    if gaps:
+        al_summary += (
+            f"  *** TERMS PARSE INCOMPLETE — {', '.join(gaps)} read as 0.0, "
+            "which real AL syndicate deals never are. Treat fee/net-return "
+            "math as unreliable and follow Scenario Math Contract rule 6. ***\n"
+        )
 
     deck_summary = ""
     if deck_content is not None:
@@ -687,6 +756,15 @@ _STYLES = """<style>
     color: #9ca3af;
     list-style: none;
     margin-left: -1.1rem;
+  }
+  section.datagap {
+    background: #fef2f2;
+    border: 2px solid #b91c1c;
+    color: #7f1d1d;
+    padding: 0.5rem 0.8rem;
+    margin-bottom: 1rem;
+    border-radius: 3px;
+    font-size: 0.9rem;
   }
   section.priorities {
     background: #fffbeb;
@@ -816,7 +894,7 @@ _STYLES = """<style>
     letter-spacing: 0.05em;
   }
   table.scenarios td.num, table.scenarios th:nth-child(2),
-  table.scenarios th:nth-child(3) {
+  table.scenarios th:nth-child(3), table.scenarios th:nth-child(4) {
     text-align: right;
     font-variant-numeric: tabular-nums;
     width: 60px;

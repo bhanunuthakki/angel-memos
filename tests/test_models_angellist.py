@@ -102,3 +102,38 @@ def test_angellist_metadata_ignores_unknown_fields() -> None:
     (a tradeoff accepted so the JSON-round-trip use case works)."""
     m = AngelListMetadata.model_validate({**_spotai_kwargs(), "unknown_field": "oops"})
     assert not hasattr(m, "unknown_field")
+
+
+# ---------------------------------------------------------------------------
+# Terms-parse completeness. An image-only AL memo parses the fee-critical
+# fields as 0.0 and every downstream net-return figure silently goes wrong,
+# so >=2 zeros in that set must surface as a blocking gap.
+# ---------------------------------------------------------------------------
+
+
+def test_complete_terms_have_no_gaps() -> None:
+    m = AngelListMetadata.model_validate(_spotai_kwargs())
+    assert m.terms_gaps() == []
+
+
+def test_unparsed_fee_fields_are_flagged() -> None:
+    """The Dexterity case: no TERMS text layer, so carry/min/allocation/round
+    size all parse to 0.0."""
+    kwargs = _spotai_kwargs() | {
+        "gross_carry_pct": 0.0,
+        "min_investment_usd": 0.0,
+        "allocation_usd": 0.0,
+        "estimated_round_size_usd": 0.0,
+    }
+    gaps = AngelListMetadata.model_validate(kwargs).terms_gaps()
+    assert set(gaps) == {
+        "gross_carry_pct",
+        "min_investment_usd",
+        "allocation_usd",
+        "estimated_round_size_usd",
+    }
+
+
+def test_single_zero_field_is_a_disclosure_quirk_not_a_gap() -> None:
+    kwargs = _spotai_kwargs() | {"allocation_usd": 0.0}
+    assert AngelListMetadata.model_validate(kwargs).terms_gaps() == []

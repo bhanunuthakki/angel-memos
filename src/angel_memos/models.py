@@ -77,7 +77,7 @@ class _ScenarioBase(BaseModel):
 
 
 class ArrScenario(_ScenarioBase):
-    """`arr_multiple` method: exit value = terminal ARR × exit multiple."""
+    """`arr_multiple` method: exit value = terminal ARR x exit multiple."""
 
     name: str = Field(min_length=1)
     cagr: float
@@ -85,7 +85,7 @@ class ArrScenario(_ScenarioBase):
 
 
 class RevenueEbitdaScenario(_ScenarioBase):
-    """`revenue_ebitda` method: exit value = terminal revenue × EBITDA margin × EV/EBITDA."""
+    """`revenue_ebitda` method: exit value = terminal revenue x EBITDA margin x EV/EBITDA."""
 
     name: str = Field(min_length=1)
     revenue_cagr: float
@@ -94,7 +94,7 @@ class RevenueEbitdaScenario(_ScenarioBase):
 
 
 class RevenuePeScenario(_ScenarioBase):
-    """`revenue_pe` method: exit value = terminal revenue × net margin × P/E."""
+    """`revenue_pe` method: exit value = terminal revenue x net margin x P/E."""
 
     name: str = Field(min_length=1)
     revenue_cagr: float
@@ -103,7 +103,7 @@ class RevenuePeScenario(_ScenarioBase):
 
 
 class GmvScenario(_ScenarioBase):
-    """`gmv_take` method: exit value = terminal GMV × take rate × revenue multiple."""
+    """`gmv_take` method: exit value = terminal GMV x take rate x revenue multiple."""
 
     name: str = Field(min_length=1)
     gmv_cagr: float
@@ -368,6 +368,28 @@ class AngelListMetadata(BaseModel):
     def post_money_usd(self) -> float:
         return self.pre_money_usd + self.estimated_round_size_usd
 
+    def terms_gaps(self) -> list[str]:
+        """Fields whose zero values indicate an incomplete TERMS parse.
+
+        Real AngelList syndicate deals essentially always carry a nonzero
+        carry, minimum check, and allocation; a memo whose TERMS table has
+        no text layer (image-only capture) parses these as 0.0 and every
+        downstream net-return figure silently becomes wrong. One zero can
+        be a genuine disclosure quirk, so only two or more zeros in the
+        fee-critical set reads as a parse failure. Callers must surface a
+        non-empty result as a BLOCKING data gap, not a footnote."""
+        zeros = [
+            name
+            for name, value in (
+                ("gross_carry_pct", self.gross_carry_pct),
+                ("min_investment_usd", self.min_investment_usd),
+                ("allocation_usd", self.allocation_usd),
+                ("estimated_round_size_usd", self.estimated_round_size_usd),
+            )
+            if value == 0
+        ]
+        return zeros if len(zeros) >= 2 else []
+
 
 # ---------------------------------------------------------------------------
 # DiligenceTopics — Phase A output. Adversarial structure: every section gets
@@ -406,6 +428,12 @@ class ScenarioOutcome(BaseModel):
     method-specific scenarios; this is the rough distribution Claude
     builds at the diligence stage so the HTML can render an outcome
     chart that the bull/bear debate references.
+
+    `derivation` is the micro-economics contract: every MoM must be built
+    bottom-up (exit revenue x named comp multiple → exit EV ÷ entry
+    post-money x dilution retention), not asserted. A scenario whose math
+    can't be written in one line is a guess, and guesses inflated E[MoM]
+    ~50% on real deals before this field existed.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -414,6 +442,10 @@ class ScenarioOutcome(BaseModel):
     probability: float = Field(ge=0.0, le=1.0)
     return_mom: float = Field(ge=0.0)  # gross multiple-on-money at exit (1.0 = break-even)
     key_assumption: str = Field(min_length=1)
+    # Bottom-up math, e.g. "$350M rev x 9x (Symbotic 10.3x haircut) = $3.15B
+    # EV ÷ $1.66B entry x 0.8 dilution = 1.5x". Required — see class docstring.
+    derivation: str = Field(min_length=1)
+    exit_value_usd: float | None = Field(default=None, ge=0.0)  # implied exit EV
 
 
 class ScenarioAnalysisSection(DiligenceSection):

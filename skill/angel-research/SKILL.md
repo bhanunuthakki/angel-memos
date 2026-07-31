@@ -43,6 +43,17 @@ founder evidence, comparables, kill conditions, and open questions.
 - `UNVERIFIABLE` must state what was searched and what evidence was missing.
 - A claim is load-bearing when reversing it could change the recommendation,
   price/ownership judgment, or a decision tripwire.
+- Valuation multiples for public comps are always load-bearing: fetch the
+  current figure (price, revenue, resulting multiple) live with source and
+  access date. A multiple recalled from model memory is an auto-fail — a
+  remembered figure has been observed off by 2x within a single quarter.
+- Exit math follows the micro contract: exit revenue × named-comp multiple →
+  exit EV → ÷ entry post-money → × dilution retention → net of the preference
+  stack and fees. Probabilities cite company-specific execution gates;
+  population base rates are a closing sanity check only. Include exactly one
+  first-principles regime-change tail scenario (what economics regime the
+  asset could unlock, priced units × displaced cost × capture) in place of a
+  generic "generational" cell.
 - Memo recommendations take a side: `GO`, `GO IF X`, `PASS`, `PASS UNLESS X`, or
   `WATCH WHEN X`.
 

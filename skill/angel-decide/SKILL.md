@@ -51,6 +51,33 @@ accept or replace them. For a `pass` verdict or `custom` method, omit scenario
 math and benchmarks as the installed schema permits; all other schema-required
 decision fields remain mandatory.
 
+## Scenario and benchmark construction (micro-economics contract)
+
+When proposing scenario values, exit multiples, or benchmarks, build them
+bottom-up — never assert them:
+
+1. Exit values derive as exit revenue × a named comp's multiple, with the
+   comp's multiple verified live (web) at interview time, dated, and sourced.
+   Never quote a public comp's multiple from memory.
+2. Present break-even growth alongside the entry price: revenue needed at the
+   comp multiple to justify the post-money, versus current revenue.
+3. State which scenarios the sourced TAM constrains; a base case that needs
+   half the category TAM is presented as a red flag before probabilities are
+   discussed.
+4. Propose probabilities from company-specific execution gates (booked vs
+   pipeline revenue, deployment stage, next-round dependency), each gate named.
+   Population base rates are a one-line closing sanity check, never an input.
+5. Offer exactly one regime-change tail scenario constructed first-principles
+   (what economics regime could the asset unlock; priced as units × displaced
+   cost × capture). The user may weight it near zero or reject it, but it must
+   be put on the table — comp-anchored ceilings truncate the power-law tail.
+6. Walk the capital structure before the net numbers: expected dilution from
+   rounds implied by burn vs runway vs exit year, total preferences ahead of
+   the SPV, then fees and carry — and present MoM net of all three.
+7. If the parsed terms show `AngelListMetadata.terms_gaps()` non-empty, say so
+   before any net math and treat re-capture of the TERMS table as a
+   prerequisite, not a caveat.
+
 Common valuation methods are `arr_multiple`, `revenue_ebitda`, `revenue_pe`,
 `gmv_take`, `seed_outcome`, and `custom`. The installed
 `angel_memos.models.Decision` schema is authoritative for enum values, fields,
