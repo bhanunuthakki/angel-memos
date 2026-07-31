@@ -22,6 +22,28 @@ const QUIET_MS = 3000; // no new download/tab activity for this long => done
 const MIN_RUN_MS = 2000; // never finalize sooner than this after am-finalize
 const MAX_RUN_MS = 45000; // hard cap so a stuck download/tab can't hang forever
 const PRINT_TIMEOUT_MS = 15000; // debugger print must not hang the capture
+const POLL_MS = 500; // quiescence poll; also the service-worker keepalive beat
+
+// --- Crash-safety (v0.4.3) ---------------------------------------------------
+// job.json is the drop-completeness marker, written LAST. It used to live or
+// die with the service worker's in-memory `active`: an MV3 worker is killed
+// after ~30s idle and setTimeout callbacks do NOT reset that idle timer, so a
+// capture that sat in waitForQuiescence lost its state and the drop was left
+// with the PDFs but no job.json — invisible to `angel-memos ingest` forever.
+//
+// Two mechanisms close that hole:
+//   1. State is mirrored into chrome.storage.session, so a restarted worker
+//      can pick the capture back up instead of throwing "capture not armed".
+//   2. An alarm (alarms DO wake a terminated worker; timers do not) acts as
+//      the backstop that finalizes an abandoned capture.
+const STATE_KEY = "capture";
+const GUARD_ALARM = "am-finalize-guard";
+// Comfortably past MAX_RUN_MS and the content script's 60s deck fetch, so the
+// guard only ever fires for a capture that genuinely died.
+const GUARD_DELAY_MINUTES = 2;
+// Never resurrect a capture older than this; a stale record must not attach
+// itself to an unrelated later drop.
+const CAPTURE_TTL_MS = 10 * 60 * 1000;
 
 // Hosts the deck URL may point at (it comes from page resource timing).
 const DECK_URL_HOSTS = /(\.amazonaws\.com|\.cloudfront\.net|\.angellist\.com|\.angel\.co)$/i;
@@ -74,7 +96,9 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
 chrome.downloads.onCreated.addListener((item) => {
   if (!active) return;
   active.pending.add(item.id);
+  active.seen.add(item.id);
   active.lastActivity = Date.now();
+  persist();
 });
 
 chrome.downloads.onChanged.addListener((delta) => {
@@ -83,6 +107,7 @@ chrome.downloads.onChanged.addListener((delta) => {
   if (state === "complete" || state === "interrupted") {
     if (active.pending.delete(delta.id) && state === "complete") active.completed += 1;
     active.lastActivity = Date.now();
+    persist();
   }
 });
 
@@ -94,6 +119,7 @@ chrome.tabs.onCreated.addListener((tab) => {
   if (!active || tab.openerTabId !== active.tabId || tab.id == null) return;
   active.viewerTabs.add(tab.id);
   active.lastActivity = Date.now();
+  persist();
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
@@ -107,7 +133,10 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
       url: "data:application/pdf;base64," + b64,
       filename: `${ROOT}/${active.dir}/${name}`,
     });
-    if (active) active.deckCaptured = true;
+    if (active) {
+      active.deckCaptured = true;
+      await persist();
+    }
   } catch (err) {
     console.warn("[angel-memos] deck viewer print failed:", err);
   } finally {
@@ -124,26 +153,31 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg) return false;
-  const respond = (promise) => {
-    promise
+  // Every phase after am-arm runs in a worker that may have been restarted
+  // since, so rehydrate `active` before dispatching rather than failing with
+  // "capture not armed" and stranding the drop.
+  const respond = (run) => {
+    Promise.resolve()
+      .then(async () => {
+        if (!active && msg.kind !== "am-arm") active = await restore();
+        return run();
+      })
       .then((value) => sendResponse(Object.assign({ ok: true }, value || {})))
       .catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true; // async sendResponse
   };
   switch (msg.kind) {
     case "am-arm":
-      return respond(arm(msg, sender.tab));
+      return respond(() => arm(msg, sender.tab));
     case "am-print-page":
-      return respond(printMemo(sender.tab));
+      return respond(() => printMemo(sender.tab));
     case "am-deck-url":
-      return respond(downloadDeckUrl(msg));
+      return respond(() => downloadDeckUrl(msg));
     case "am-finalize":
-      return respond(finalize());
+      return respond(() => finalize());
     case "am-run": // stale content script (pre-0.4) — print + finalize
       console.warn("[angel-memos] legacy am-run — reload the AngelList tab");
-      return respond(
-        printMemo(sender.tab).then(() => finalize())
-      );
+      return respond(() => printMemo(sender.tab).then(() => finalize()));
     default:
       return false;
   }
@@ -165,12 +199,90 @@ async function arm(msg, tab) {
     startedAt: now,
     lastActivity: now,
     pending: new Set(),
+    seen: new Set(),
     viewerTabs: new Set(),
     completed: 0,
     deckCaptured: false,
+    finalizing: false,
   };
+  await persist();
+  // Arm the backstop before anything can fail: from here on, this capture
+  // gets a job.json even if the worker never survives to write one normally.
+  await chrome.alarms.create(GUARD_ALARM, { delayInMinutes: GUARD_DELAY_MINUTES });
   console.log(`[angel-memos] armed for "${company}" -> ${ROOT}/${dir}/`);
 }
+
+// --- Persistence + crash recovery. -------------------------------------------
+
+function persist() {
+  if (!active) return Promise.resolve();
+  const snapshot = {
+    company: active.company,
+    dir: active.dir,
+    tier: active.tier,
+    sourceUrl: active.sourceUrl,
+    tabId: active.tabId,
+    startedAt: active.startedAt,
+    lastActivity: active.lastActivity,
+    // Sets aren't structured-cloneable into storage; round-trip as arrays.
+    pending: [...active.pending],
+    seen: [...active.seen],
+    viewerTabs: [...active.viewerTabs],
+    completed: active.completed,
+    deckCaptured: active.deckCaptured,
+    finalizing: active.finalizing,
+  };
+  return chrome.storage.session
+    .set({ [STATE_KEY]: snapshot })
+    .catch((err) => console.warn("[angel-memos] persist failed:", err));
+}
+
+async function restore() {
+  let raw;
+  try {
+    raw = (await chrome.storage.session.get(STATE_KEY))[STATE_KEY];
+  } catch (err) {
+    console.warn("[angel-memos] restore failed:", err);
+    return null;
+  }
+  if (!raw) return null;
+  if (Date.now() - raw.startedAt > CAPTURE_TTL_MS) {
+    await clearPersisted();
+    return null;
+  }
+  return Object.assign({}, raw, {
+    pending: new Set(raw.pending || []),
+    seen: new Set(raw.seen || []),
+    viewerTabs: new Set(raw.viewerTabs || []),
+  });
+}
+
+async function clearPersisted() {
+  await chrome.storage.session.remove(STATE_KEY).catch(() => {});
+  await chrome.alarms.clear(GUARD_ALARM).catch(() => {});
+}
+
+// The backstop. Alarms wake a terminated service worker; setTimeout does not.
+// If this fires, the capture never finalized normally — write job.json from
+// the persisted state so the drop becomes ingestible.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== GUARD_ALARM) return;
+  if (!active) active = await restore();
+  if (!active || active.finalizing) {
+    await clearPersisted();
+    return;
+  }
+  console.warn(`[angel-memos] guard fired — finalizing abandoned "${active.company}"`);
+  // Downloads have long since settled by now; don't re-wait for quiescence.
+  active.pending.clear();
+  active.viewerTabs.clear();
+  try {
+    await finalize();
+  } catch (err) {
+    console.warn("[angel-memos] guard finalize failed:", err);
+    await clearPersisted();
+  }
+});
 
 async function printMemo(tab) {
   if (!active) throw new Error("capture not armed");
@@ -202,12 +314,18 @@ async function downloadDeckUrl(msg) {
   const name = sanitizeFile(msg.name || "deck.pdf");
   await startDownload({ url, filename: `${ROOT}/${active.dir}/${name}` });
   active.deckCaptured = true;
+  await persist();
   console.log(`[angel-memos] deck download started: ${name}`);
 }
 
 async function finalize() {
   if (!active) throw new Error("capture not armed");
+  // The guard alarm and an am-finalize message can both land; job.json must
+  // be written exactly once.
+  if (active.finalizing) return { count: active.completed };
+  active.finalizing = true;
   active.lastActivity = Date.now();
+  await persist();
   await waitForQuiescence();
 
   const job = {
@@ -230,6 +348,7 @@ async function finalize() {
   const count = active.completed;
   console.log(`[angel-memos] done "${active.company}": ${count} file(s) saved`);
   active = null;
+  await clearPersisted();
   return { count };
 }
 
@@ -239,7 +358,15 @@ async function finalize() {
 function waitForQuiescence() {
   const startedWaiting = Date.now();
   return new Promise((resolve) => {
-    const check = () => {
+    const check = async () => {
+      if (!active) return resolve();
+      // Reconcile against the download manager instead of trusting that every
+      // completion delta was observed. A missed onChanged used to leave an id
+      // stuck in `pending` forever, forcing the full MAX_RUN_MS wait — which
+      // is precisely the window in which the worker got killed.
+      // The API call doubles as the keepalive: each chrome.* call resets the
+      // ~30s idle timer, whereas a bare setTimeout chain does not.
+      await reconcilePending();
       if (!active) return resolve();
       const now = Date.now();
       const waited = now - startedWaiting;
@@ -248,10 +375,34 @@ function waitForQuiescence() {
       const quiet =
         active.pending.size === 0 && active.viewerTabs.size === 0 && idle > QUIET_MS;
       if (waited > MIN_RUN_MS && quiet) return resolve();
-      setTimeout(check, 500);
+      setTimeout(check, POLL_MS);
     };
-    setTimeout(check, 500);
+    setTimeout(check, POLL_MS);
   });
+}
+
+// Drop any pending id the download manager reports as settled.
+async function reconcilePending() {
+  if (!active || active.pending.size === 0) {
+    // Still touch a chrome API so the idle timer resets during a quiet wait.
+    await chrome.runtime.getPlatformInfo().catch(() => {});
+    return;
+  }
+  for (const id of [...active.pending]) {
+    let item;
+    try {
+      item = (await chrome.downloads.search({ id }))[0];
+    } catch {
+      continue;
+    }
+    // A vanished record can never produce a completion event; treat it as
+    // settled rather than waiting on it forever.
+    if (!item || item.state === "complete" || item.state === "interrupted") {
+      if (active.pending.delete(id) && item && item.state === "complete") {
+        active.completed += 1;
+      }
+    }
+  }
 }
 
 async function printPageToPdf(tabId) {

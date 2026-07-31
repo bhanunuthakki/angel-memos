@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Angel Memos Capture",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "One-click capture of an AngelList deal's memo (page PDF) + pitch deck into Downloads/angel-memos/<Company>/ for the angel-memos watcher. Ignores other dataroom docs.",
-  "permissions": ["downloads", "debugger", "activeTab", "tabs"],
+  "permissions": ["downloads", "debugger", "activeTab", "tabs", "storage", "alarms"],
   "host_permissions": ["https://*.angellist.com/*", "https://*.angel.co/*"],
   "background": {
     "service_worker": "background.js"

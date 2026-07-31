@@ -267,6 +267,11 @@ def watch(inbox: Path | None, interval: int) -> None:
 
 def _echo_ingest(result: IngestResult) -> None:
     click.echo(f"Ingested {result.job.company} -> {result.folder} ({len(result.moved)} files)")
+    if result.deduped:
+        click.echo(
+            f"  Discarded {len(result.deduped)} byte-identical re-capture(s): "
+            f"{', '.join(result.deduped)}"
+        )
     if result.missing_angellist:
         click.echo(
             "  WARNING: no angellist*.pdf in this drop — diligence needs the AL memo.",

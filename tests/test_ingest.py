@@ -2,6 +2,7 @@
 moves into the Evaluation folder, and collision handling. No Claude calls."""
 
 import json
+import stat
 import zipfile
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from angel_memos.ingest import (
     JOB_FILENAME,
     JobRequest,
     ingest_folder,
+    prune_inbox,
     run_ingest,
     scan_inbox,
 )
@@ -24,6 +26,16 @@ def _cfg(tmp_path: Path) -> Config:
     )
 
 
+def _payload(filename: str) -> bytes:
+    """Distinct bytes per document.
+
+    Two genuinely different captured documents are never byte-identical, and
+    ingest's dedupe pass treats identical bytes as the same document — so a
+    fixture that gave the memo and the deck the same content would exercise a
+    situation that cannot occur and mask the real behaviour."""
+    return b"%PDF-1.4 fake " + filename.encode()
+
+
 def _make_drop(
     inbox: Path,
     name: str = "Acme",
@@ -33,7 +45,7 @@ def _make_drop(
     drop = inbox / name
     drop.mkdir(parents=True)
     for filename in files if files is not None else ["angellist - Acme.pdf", "deck - Acme.pdf"]:
-        (drop / filename).write_bytes(b"%PDF-1.4 fake")
+        (drop / filename).write_bytes(_payload(filename))
     payload: dict[str, object] = {"company": name, "tier": "quick"}
     if job is not None:
         payload = job
@@ -327,3 +339,209 @@ def test_ingest_present_deck_not_flagged(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     drop = _make_drop(tmp_path / "inbox")  # default files include a deck
     assert ingest_folder(drop, cfg).missing_deck is False
+
+
+# ---------------------------------------------------------------------------
+# Byte-identity dedupe: a re-capture of an already-ingested deal must not
+# accumulate " (2)" copies. Identity is the file's bytes, never its name.
+# ---------------------------------------------------------------------------
+
+
+def _prepopulated_acme(cfg: Config) -> Path:
+    """An Acme folder already holding the default drop's two documents."""
+    dest = cfg.evaluation_root / "Acme"
+    dest.mkdir(parents=True)
+    for filename in ("angellist - Acme.pdf", "deck - Acme.pdf"):
+        (dest / filename).write_bytes(_payload(filename))
+    return dest
+
+
+def test_ingest_drops_byte_identical_file_instead_of_suffixing(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    dest = cfg.evaluation_root / "Acme"
+    dest.mkdir(parents=True)
+    (dest / "deck - Acme.pdf").write_bytes(_payload("deck - Acme.pdf"))
+    drop = _make_drop(tmp_path / "inbox", files=["deck - Acme.pdf"])
+
+    result = ingest_folder(drop, cfg)
+
+    assert not (dest / "deck - Acme (2).pdf").exists()
+    assert (dest / "deck - Acme.pdf").read_bytes() == _payload("deck - Acme.pdf")
+    assert result.moved == []
+    assert "deck - Acme.pdf" in result.deduped
+
+
+def test_ingest_dedupes_identical_bytes_under_a_different_name(tmp_path: Path) -> None:
+    """The OneNav case: the same PDF re-captured under the extension's naming
+    must be recognised by content, not filename."""
+    cfg = _cfg(tmp_path)
+    dest = cfg.evaluation_root / "Acme"
+    dest.mkdir(parents=True)
+    (dest / "Acme Series C Deck.pdf").write_bytes(_payload("Acme deck.pdf"))
+    drop = _make_drop(tmp_path / "inbox", files=["Acme deck.pdf"])
+
+    result = ingest_folder(drop, cfg)
+
+    assert not (dest / "Acme deck.pdf").exists()
+    assert result.deduped == ["Acme deck.pdf"]
+
+
+def test_ingest_keeps_same_named_file_with_different_bytes(tmp_path: Path) -> None:
+    """Guard against over-deletion: a re-capture whose bytes differ is a
+    DIFFERENT document and must be kept, suffixed."""
+    cfg = _cfg(tmp_path)
+    dest = cfg.evaluation_root / "Acme"
+    dest.mkdir(parents=True)
+    (dest / "deck - Acme.pdf").write_bytes(b"original bytes")
+    drop = _make_drop(tmp_path / "inbox", files=["deck - Acme.pdf"])
+
+    result = ingest_folder(drop, cfg)
+
+    assert (dest / "deck - Acme.pdf").read_bytes() == b"original bytes"
+    assert (dest / "deck - Acme (2).pdf").is_file()
+    assert result.deduped == []
+
+
+def test_ingest_dedupes_identical_members_within_one_drop(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    drop = tmp_path / "inbox" / "Acme"
+    drop.mkdir(parents=True)
+    (drop / "angellist - Acme.pdf").write_bytes(b"%PDF memo")
+    (drop / "deck.pdf").write_bytes(b"%PDF deck")
+    (drop / "deck-copy.pdf").write_bytes(b"%PDF deck")
+    (drop / JOB_FILENAME).write_text(json.dumps({"company": "Acme", "tier": "none"}))
+
+    result = ingest_folder(drop, cfg)
+
+    dest = cfg.evaluation_root / "Acme"
+    # Exactly one copy of the deck bytes survives; which name wins is the
+    # traversal order, not a guarantee worth pinning.
+    survivors = sorted(p.name for p in dest.iterdir())
+    assert len(survivors) == 2
+    assert "angellist - Acme.pdf" in survivors
+    assert len(result.deduped) == 1
+    assert result.deduped[0] in {"deck.pdf", "deck-copy.pdf"}
+
+
+def test_ingest_dedupes_zip_members_against_existing_files(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    dest = cfg.evaluation_root / "Acme"
+    dest.mkdir(parents=True)
+    (dest / "Deck.pdf").write_bytes(b"%PDF deck")
+    drop = tmp_path / "inbox" / "Acme"
+    drop.mkdir(parents=True)
+    _make_zip(drop / "all.zip", {"Deck.pdf": b"%PDF deck"})
+    (drop / JOB_FILENAME).write_text(json.dumps({"company": "Acme", "tier": "none"}))
+
+    ingest_folder(drop, cfg)
+
+    assert not (dest / "Deck (2).pdf").exists()
+
+
+def test_fully_deduped_drop_is_still_consumed(tmp_path: Path) -> None:
+    """A wholly redundant re-capture leaves no drop behind to re-scan."""
+    cfg = _cfg(tmp_path)
+    dest = _prepopulated_acme(cfg)
+    drop = _make_drop(tmp_path / "inbox")
+
+    result = ingest_folder(drop, cfg)
+
+    assert not drop.exists()
+    assert sorted(result.deduped) == ["angellist - Acme.pdf", "deck - Acme.pdf"]
+    assert sorted(p.name for p in dest.iterdir()) == [
+        "angellist - Acme.pdf",
+        "deck - Acme.pdf",
+    ]
+
+
+def test_deduped_files_still_count_toward_material_presence(tmp_path: Path) -> None:
+    """A re-capture of an already-complete folder is not 'missing' its deck."""
+    cfg = _cfg(tmp_path)
+    _prepopulated_acme(cfg)
+    drop = _make_drop(tmp_path / "inbox")
+
+    result = ingest_folder(drop, cfg)
+
+    assert result.missing_angellist is False
+    assert result.missing_deck is False
+
+
+# ---------------------------------------------------------------------------
+# Inbox cleanup: consumed/empty drop dirs must not accumulate in Downloads.
+# ---------------------------------------------------------------------------
+
+
+def test_prune_inbox_removes_empty_leftover_dirs(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    stale = inbox / "Lazarus Energy"
+    stale.mkdir(parents=True)
+    (inbox / "Keep").mkdir()
+    (inbox / "Keep" / "angellist - Keep.pdf").write_bytes(b"%PDF")
+
+    pruned = prune_inbox(inbox)
+
+    assert pruned == ["Lazarus Energy"]
+    assert not stale.exists()
+    assert (inbox / "Keep").is_dir()
+
+
+def test_prune_inbox_keeps_dirs_holding_uningested_files(tmp_path: Path) -> None:
+    """A drop with files but no job.json is an incomplete capture, not litter —
+    pruning it would silently discard a real capture."""
+    inbox = tmp_path / "inbox"
+    partial = inbox / "Dexterity"
+    partial.mkdir(parents=True)
+    (partial / "angellist - Dexterity.pdf").write_bytes(b"%PDF")
+
+    assert prune_inbox(inbox) == []
+    assert partial.is_file() is False and partial.is_dir()
+
+
+def test_run_ingest_prunes_consumed_dirs(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    inbox = tmp_path / "inbox"
+    (inbox / "Stale").mkdir(parents=True)
+    _make_drop(inbox, name="Acme")
+
+    run_ingest(inbox, cfg)
+
+    assert not (inbox / "Stale").exists()
+
+
+def test_prune_inbox_removes_readonly_drop_dir(tmp_path: Path) -> None:
+    """Chrome marks every drop dir ReadOnly, and Windows RemoveDirectory then
+    fails with WinError 5 even on an empty dir — which silently stranded every
+    consumed drop in Downloads."""
+    inbox = tmp_path / "inbox"
+    stale = inbox / "Lazarus Energy"
+    stale.mkdir(parents=True)
+    stale.chmod(stat.S_IREAD)
+    try:
+        assert prune_inbox(inbox) == ["Lazarus Energy"]
+        assert not stale.exists()
+    finally:
+        if stale.exists():
+            stale.chmod(stat.S_IWRITE)
+
+
+def test_consumed_readonly_drop_is_removed_by_ingest(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    drop = _make_drop(tmp_path / "inbox")
+    drop.chmod(stat.S_IREAD)
+    try:
+        ingest_folder(drop, cfg)
+        assert not drop.exists()
+    finally:
+        if drop.exists():
+            drop.chmod(stat.S_IWRITE)
+
+
+def test_prune_inbox_tolerates_locked_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inbox = tmp_path / "inbox"
+    (inbox / "Stale").mkdir(parents=True)
+
+    def boom(self: Path) -> None:
+        raise PermissionError("[WinError 5] Access is denied")
+
+    monkeypatch.setattr(Path, "rmdir", boom)
+    assert prune_inbox(inbox) == []  # must not raise

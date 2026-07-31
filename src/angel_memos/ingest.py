@@ -13,9 +13,11 @@ A drop is ready iff `job.json` exists and no in-flight download artifacts
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import re
 import shutil
+import stat
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -49,6 +51,9 @@ _DECK_HINT: tuple[str, ...] = ("deck", "pitch")
 # private regex: ingest only needs a coarse "did we get an AL memo" flag.
 _ANGELLIST_HINT = "angellist"
 
+# Streaming hash block. Decks run to several MB; never slurp a PDF whole.
+_HASH_CHUNK_BYTES = 1 << 20
+
 
 def default_inbox() -> Path:
     return Path.home() / "Downloads" / "angel-memos"
@@ -74,6 +79,10 @@ class IngestResult(BaseModel):
     moved: list[str]
     missing_angellist: bool
     missing_deck: bool = True
+    # Source names discarded as byte-identical to a file already in the company
+    # folder. These still evidence the material's presence, so the missing_*
+    # flags are computed over moved + deduped.
+    deduped: list[str] = Field(default_factory=list)
 
 
 def scan_inbox(inbox: Path) -> list[Path]:
@@ -100,13 +109,17 @@ def scan_inbox(inbox: Path) -> list[Path]:
 def ingest_folder(drop: Path, cfg: Config) -> IngestResult:
     """Move one drop's files into `<Evaluation>/<job.company>/`.
 
-    Existing destination files are never overwritten — collisions get a
-    ` (2)` style suffix. The consumed drop directory is removed."""
+    Existing destination files are never overwritten — a same-named file with
+    DIFFERENT bytes gets a ` (2)` style suffix, while one whose bytes already
+    exist in the folder is discarded rather than copied under a second name.
+    The consumed drop directory is removed."""
     job = JobRequest.model_validate_json((drop / JOB_FILENAME).read_text(encoding="utf-8"))
     dest = _safe_dest(cfg.evaluation_root, job.company)
     dest.mkdir(parents=True, exist_ok=True)
 
+    index = _ContentIndex(dest)
     moved: list[str] = []
+    deduped: list[str] = []
     for src in sorted(drop.iterdir()):
         if not src.is_file() or src.name == JOB_FILENAME:
             continue
@@ -114,25 +127,139 @@ def ingest_folder(drop: Path, cfg: Config) -> IngestResult:
         # unpack it so the individual deck/docs land in the company folder
         # where load_materials can classify them.
         if src.suffix.lower() == ".zip":
-            moved.extend(_extract_zip(src, dest))
+            extracted, redundant = _extract_zip(src, dest, index)
+            moved.extend(extracted)
+            deduped.extend(redundant)
             src.unlink()
+            continue
+        if index.match(src) is not None:
+            # Re-capture of a document already held. Identity is the bytes, so
+            # this cannot discard a revised deck that merely kept its filename.
+            src.unlink()
+            deduped.append(src.name)
             continue
         target = _collision_free(dest / src.name)
         shutil.move(str(src), str(target))
+        index.add(target)
         moved.append(target.name)
 
     (drop / JOB_FILENAME).unlink()
     _remove_if_empty(drop)
 
-    missing_angellist = not any(_ANGELLIST_HINT in name.lower() for name in moved)
-    missing_deck = not any(hint in name.lower() for name in moved for hint in _DECK_HINT)
+    seen = moved + deduped
+    missing_angellist = not any(_ANGELLIST_HINT in name.lower() for name in seen)
+    missing_deck = not any(hint in name.lower() for name in seen for hint in _DECK_HINT)
+    if deduped:
+        logger.info("dropped %d byte-identical re-capture(s) into %s", len(deduped), dest)
     return IngestResult(
         job=job,
         folder=dest,
         moved=moved,
         missing_angellist=missing_angellist,
         missing_deck=missing_deck,
+        deduped=deduped,
     )
+
+
+class _ContentIndex:
+    """Byte-identity index over a company folder.
+
+    Content, not filename, decides identity: the extension names a re-capture
+    `<Company> deck.pdf` while an earlier manual save may be
+    `<Company> Series C Deck.pdf`. Hashing is lazy and bucketed by size, so the
+    common case (no size peer) costs one `stat` and reads nothing.
+    """
+
+    def __init__(self, folder: Path) -> None:
+        self._by_size: dict[int, list[Path]] = {}
+        self._digests: dict[Path, str] = {}
+        if folder.is_dir():
+            for entry in folder.iterdir():
+                if entry.is_file():
+                    self.add(entry)
+
+    def add(self, path: Path) -> None:
+        with contextlib.suppress(OSError):
+            self._by_size.setdefault(path.stat().st_size, []).append(path)
+
+    def match(self, candidate: Path) -> Path | None:
+        """The indexed file with identical bytes, or None."""
+        try:
+            peers = self._by_size.get(candidate.stat().st_size)
+        except OSError:
+            return None
+        if not peers:
+            return None
+        wanted = _sha256(candidate)
+        if wanted is None:
+            return None
+        for peer in peers:
+            if self._digest(peer) == wanted:
+                return peer
+        return None
+
+    def _digest(self, path: Path) -> str | None:
+        if path not in self._digests:
+            digest = _sha256(path)
+            if digest is None:
+                return None
+            self._digests[path] = digest
+        return self._digests[path]
+
+
+def _sha256(path: Path) -> str | None:
+    """Streaming digest, or None if the file can't be read (a Drive-sync lock
+    must degrade to 'not a known duplicate', never to a wrong match)."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(_HASH_CHUNK_BYTES):
+                digest.update(chunk)
+    except OSError as exc:
+        logger.warning("cannot hash %s for dedupe: %s", path, exc)
+        return None
+    return digest.hexdigest()
+
+
+def prune_inbox(inbox: Path) -> list[str]:
+    """Delete empty drop directories left behind in the Downloads inbox.
+
+    Only *empty* directories go: a drop still holding files is either mid-
+    capture or an extension run that never wrote job.json, and discarding it
+    would destroy a real capture. Returns the removed directory names."""
+    if not inbox.is_dir():
+        return []
+    removed: list[str] = []
+    for entry in sorted(inbox.iterdir()):
+        if not entry.is_dir():
+            continue
+        try:
+            if any(entry.iterdir()):
+                continue
+            _rmdir(entry)
+        except OSError as exc:
+            # Drive sync / the indexer can hold a transient handle; a leftover
+            # empty dir is inert, so never let cleanup fail an ingest batch.
+            logger.debug("could not prune %s: %s", entry, exc)
+            continue
+        removed.append(entry.name)
+    return removed
+
+
+def _rmdir(folder: Path) -> None:
+    """Remove an empty directory, defeating the Windows ReadOnly attribute.
+
+    Chrome creates each `Downloads/angel-memos/<Company>/` drop directory with
+    the ReadOnly attribute set, and Windows' RemoveDirectory refuses a
+    read-only directory with WinError 5 even when it is empty — so every
+    consumed drop used to be left behind forever. Clearing the attribute and
+    retrying is the documented fix; a still-locked directory raises and is
+    handled by the caller."""
+    try:
+        folder.rmdir()
+    except PermissionError:
+        folder.chmod(stat.S_IWRITE)
+        folder.rmdir()
 
 
 def run_ingest(
@@ -162,6 +289,10 @@ def run_ingest(
             _quarantine(drop)
             if on_error is not None:
                 on_error(drop, exc)
+    # Sweep consumed/empty drop dirs every pass so the Downloads inbox stays
+    # clean on an ongoing basis, not just when a Windows rmdir happens to win.
+    for name in prune_inbox(inbox):
+        logger.info("pruned empty drop dir %s", name)
     return results
 
 
@@ -194,11 +325,14 @@ def _quarantine(drop: Path) -> None:
         drop.rename(target)
 
 
-def _extract_zip(archive: Path, dest: Path) -> list[str]:
+def _extract_zip(archive: Path, dest: Path, index: _ContentIndex) -> tuple[list[str], list[str]]:
     """Flatten a zip's file members into `dest` (collision-free), skipping
-    directories and archive cruft (`__MACOSX/`, dotfiles). Returns the names
-    written. A corrupt zip is skipped with no members extracted."""
+    directories and archive cruft (`__MACOSX/`, dotfiles). Returns
+    `(written, deduped)` — a member whose bytes already exist in `dest` is
+    extracted, recognised, and removed rather than kept as a second copy. A
+    corrupt zip is skipped with no members extracted."""
     written: list[str] = []
+    deduped: list[str] = []
     try:
         with zipfile.ZipFile(archive) as zf:
             for info in zf.infolist():
@@ -210,10 +344,18 @@ def _extract_zip(archive: Path, dest: Path) -> list[str]:
                 target = _collision_free(dest / name)
                 with zf.open(info) as member, target.open("wb") as out:
                     shutil.copyfileobj(member, out)
+                # Hash after landing: a zip member has no stable on-disk
+                # identity until written, and streaming it twice would cost
+                # a second decompression pass.
+                if index.match(target) is not None:
+                    target.unlink()
+                    deduped.append(name)
+                    continue
+                index.add(target)
                 written.append(target.name)
     except zipfile.BadZipFile:
-        return written
-    return written
+        return written, deduped
+    return written, deduped
 
 
 def _collision_free(target: Path) -> Path:
@@ -237,4 +379,4 @@ def _remove_if_empty(folder: Path) -> None:
     job.json is already gone, so scan_inbox won't re-ingest it."""
     if folder.is_dir() and not any(folder.iterdir()):
         with contextlib.suppress(OSError):
-            folder.rmdir()
+            _rmdir(folder)
