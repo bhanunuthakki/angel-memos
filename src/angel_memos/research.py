@@ -92,6 +92,11 @@ BANNED outputs:
   - Fabricated valuations or round sizes. If you can't verify a number
     via WebSearch, leave that field null and note "not disclosed" in
     `notes`.
+  - Multiples from memory. When BOTH a valuation and a revenue figure
+    were verified via WebSearch, compute `valuation_multiple`, name its
+    `multiple_basis` (e.g. "EV / ARR"), and stamp `multiple_as_of` with
+    today's date. Otherwise leave all three empty — an undated multiple
+    is worse than none (observed off 2x within a single quarter).
 
 OUTPUT SIZE DISCIPLINE: keep each comp's source list to 2-4 entries
 (short descriptions, not full multi-line URL prose). The cumulative
@@ -154,6 +159,13 @@ class CompetitorComp(BaseModel):
     last_round_date: str = ""  # "Q3 2025" / "March 2024" / empty if unknown
     valuation_usd: float | None = Field(default=None, ge=0.0)
     arr_usd: float | None = Field(default=None, ge=0.0)
+    # The comp's valuation multiple, dated. A multiple is only usable when it
+    # carries its basis and fetch date — undated multiples drift stale in the
+    # cache and have been observed off 2x within a quarter. None when the
+    # inputs (valuation + a revenue figure) aren't publicly available.
+    valuation_multiple: float | None = Field(default=None, ge=0.0)
+    multiple_basis: str = ""  # e.g. "EV / ARR", "P/S TTM"; empty iff multiple is None
+    multiple_as_of: str = ""  # date the figures were fetched, e.g. "2026-07-31"
     co_investors: list[str] = []
     notes: str = ""
     sources: list[str] = Field(min_length=1, max_length=4)
@@ -350,6 +362,10 @@ def render_comparable_deals_text(comps: ComparableDeals | None) -> str:
             money_bits.append(f"valuation ${c.valuation_usd:,.0f}")
         if c.arr_usd is not None:
             money_bits.append(f"ARR ${c.arr_usd:,.0f}")
+        if c.valuation_multiple is not None:
+            basis = c.multiple_basis or "multiple"
+            as_of = f" as of {c.multiple_as_of}" if c.multiple_as_of else " (UNDATED)"
+            money_bits.append(f"{c.valuation_multiple:g}x {basis}{as_of}")
         if c.last_round_date:
             money_bits.append(c.last_round_date)
         if money_bits:

@@ -131,13 +131,22 @@ class SeedScenario(_ScenarioBase):
 
 
 class _BenchmarkBase(BaseModel):
-    """Shared shape across all benchmark classes."""
+    """Shared shape across all benchmark classes.
+
+    `multiple_as_of` / `multiple_source` date and attribute the comparable's
+    multiple. A multiple without a date is a memory, not a fact — a public
+    comp's multiple has been observed off by 2x within one quarter — so
+    /angel-decide records when and where each figure was fetched and the
+    private memo carries both. Defaults are empty for pre-existing
+    decision.md files; new decisions should always fill them."""
 
     model_config = ConfigDict(extra="forbid")
 
     rank_label: str = Field(min_length=1)  # e.g. "Top 1", "Top 5", "Top 20"
     comparable: str = Field(min_length=1)
     exit_valuation_usd: float = Field(ge=0.0)
+    multiple_as_of: str = ""  # "2026-07-31" — date the multiple was verified
+    multiple_source: str = ""  # where it was fetched, e.g. "stockanalysis.com"
 
 
 class ArrBenchmark(_BenchmarkBase):

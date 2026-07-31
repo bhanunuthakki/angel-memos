@@ -219,3 +219,36 @@ def test_render_comparable_deals_omits_money_line_when_no_amounts() -> None:
     # The bare_comp's line should not have a money line
     # The OtherCo line should still have its money
     assert "$5,000,000" in out  # OtherCo's
+
+
+# ---------------------------------------------------------------------------
+# Dated multiples. A comp multiple is only usable with basis + fetch date —
+# undated multiples drift stale in the cache (observed off 2x in a quarter).
+# ---------------------------------------------------------------------------
+
+
+def test_comp_without_multiple_fields_still_validates() -> None:
+    """Back-compat: cached .comparable_deals_cache.json files predate the
+    multiple fields and must keep loading."""
+    c = _comp()
+    assert c.valuation_multiple is None
+    assert c.multiple_as_of == ""
+
+
+def test_dated_multiple_renders_with_basis_and_date() -> None:
+    comps = _comps(
+        comps=[
+            _comp(
+                valuation_multiple=10.3,
+                multiple_basis="P/S TTM",
+                multiple_as_of="2026-07-31",
+            ),
+            _comp(company_name="BetaCo"),
+        ]
+    )
+    assert "10.3x P/S TTM as of 2026-07-31" in render_comparable_deals_text(comps)
+
+
+def test_undated_multiple_is_labeled_undated() -> None:
+    comps = _comps(comps=[_comp(valuation_multiple=10.3), _comp(company_name="BetaCo")])
+    assert "(UNDATED)" in render_comparable_deals_text(comps)

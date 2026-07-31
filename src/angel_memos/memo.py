@@ -122,6 +122,11 @@ Output structure (Markdown). Use exactly these section headings:
   Investors, rounds, amounts, investor quality. Available metrics (ARR,
   growth, gross margin, burn, runway). Operational KPIs (retention, NRR,
   engagement). Current valuation + implied multiples.
+  MANDATORY: a "Comparable multiples (as-of dated)" table rendering the
+  decision's benchmarks — Comparable | Multiple | Basis | As-of date |
+  Source — from the benchmark fields (multiple_as_of, multiple_source).
+  A benchmark missing its as-of date is rendered with "UNDATED — verify
+  before relying" in the date column, never silently.
 
   ## 8. Scenario Analysis — Risk-Adjusted Net Returns
   Render the user-supplied scenarios from decision.md as a Markdown table
