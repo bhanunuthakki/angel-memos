@@ -610,8 +610,9 @@ def build_report(
 
 
 # Function words carrying no red-flag meaning; stripped before similarity so
-# "the founders have no exits" and "founders with zero exits" compare on
-# content tokens only.
+# "the founders have exits" and "founders with exits" compare on content
+# tokens only. Negators are deliberately NOT stopwords — "no gross margin
+# disclosure" and "gross margin fully disclosed" are opposite claims.
 _FLAG_STOPWORDS: frozenset[str] = frozenset(
     [
         "a",
@@ -631,8 +632,6 @@ _FLAG_STOPWORDS: frozenset[str] = frozenset(
         "is",
         "it",
         "its",
-        "no",
-        "not",
         "of",
         "on",
         "or",
@@ -641,7 +640,26 @@ _FLAG_STOPWORDS: frozenset[str] = frozenset(
         "this",
         "to",
         "with",
+    ]
+)
+
+# Tokens that flip a flag's polarity. Two flags sharing a topic but differing
+# on negation are opposite claims, not paraphrases; dedup keeps them apart.
+_FLAG_NEGATORS: frozenset[str] = frozenset(
+    [
+        "no",
+        "not",
+        "zero",
         "without",
+        "missing",
+        "absent",
+        "lack",
+        "lacking",
+        "never",
+        "negative",
+        "undisclosed",
+        "unverified",
+        "unverifiable",
     ]
 )
 
@@ -673,7 +691,13 @@ def dedupe_red_flags(flags: Sequence[str], *, threshold: float = 0.45) -> list[s
     clusters: list[tuple[frozenset[str], str, int]] = []  # (tokens, best_text, count)
     for flag in flags:
         tokens = _flag_tokens(flag)
+        negated = bool(tokens & _FLAG_NEGATORS)
         for i, (seen, best, count) in enumerate(clusters):
+            # Polarity guard: a shared topic with flipped negation is an
+            # OPPOSITE claim ("no gross margin disclosure" vs "gross margin
+            # fully disclosed"), never a paraphrase.
+            if bool(seen & _FLAG_NEGATORS) != negated:
+                continue
             smaller = min(len(tokens), len(seen))
             if smaller == 0:
                 continue

@@ -344,3 +344,14 @@ def test_recent_events_prompt_names_anchors_and_today() -> None:
     prompt = build_recent_events_prompt("Acme", ["robotics"], ["FedEx", "Nimble"])
     assert "FedEx, Nimble" in prompt
     assert "Acme" in prompt
+
+
+def test_comps_prompt_never_asks_for_more_than_the_schema_accepts() -> None:
+    """Adversarial-review finding: the prompt said 2-4 while the schema caps
+    at 3, inviting a guaranteed validation retry. Pin prompt to schema."""
+    cap = ComparableDeals.model_fields["comps"].metadata
+    max_len = next(m.max_length for m in cap if hasattr(m, "max_length"))
+    prompt = build_comparable_deals_prompt("Acme", ["robotics"], Stage.SEED, "robots")
+    for n in range(max_len + 1, max_len + 4):
+        assert f"2-{n}" not in prompt
+    assert f"2-{max_len}" in prompt

@@ -159,3 +159,44 @@ def test_validate_long_memo_flags_truncated_memo() -> None:
     )  # only sections 1-5
     problems = _validate_long_memo(body)
     assert any("missing sections" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# Long-memo structural validation: the MANDATORY tables are enforced, not
+# just prompted (adversarial-review finding — a real memo shipped without
+# the comparables table and nothing caught it).
+# ---------------------------------------------------------------------------
+
+
+def _memo_md(*, comparables: bool, net_mom: bool) -> str:
+    sections: list[str] = []
+    for n in range(1, 10):
+        body = "x" * 200
+        if n == 7 and comparables:
+            body += "\n\nComparable multiples (as-of dated)\n| Comp | Multiple | As-of |\n"
+        if n == 8:
+            body += "\n| Scenario | Gross | Net MoM |\n" if net_mom else "\n| Scenario | Gross |\n"
+        sections.append(f"## {n}. Section\n{body}")
+    return "# Acme — Investment Memo\n\n" + "\n\n".join(sections)
+
+
+def test_memo_with_mandated_tables_passes() -> None:
+    md = _memo_md(comparables=True, net_mom=True)
+    assert _validate_long_memo(md, has_benchmarks=True, has_scenarios=True) == []
+
+
+def test_memo_missing_comparables_table_fails_when_benchmarks_exist() -> None:
+    problems = _validate_long_memo(_memo_md(comparables=False, net_mom=True), has_benchmarks=True)
+    assert any("Comparable multiples" in p for p in problems)
+
+
+def test_memo_missing_comparables_ok_without_benchmarks() -> None:
+    """A pass/custom decision has no benchmarks; the table is not demanded."""
+    assert _validate_long_memo(_memo_md(comparables=False, net_mom=True)) == []
+
+
+def test_memo_missing_net_mom_column_fails() -> None:
+    problems = _validate_long_memo(
+        _memo_md(comparables=True, net_mom=False), has_benchmarks=True, has_scenarios=True
+    )
+    assert any("Net MoM" in p for p in problems)

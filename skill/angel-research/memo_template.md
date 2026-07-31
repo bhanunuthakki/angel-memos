@@ -11,8 +11,10 @@ BVP's own memos omit risks sections and exit math — those gaps are fixed
 here deliberately. For software-only deals, mark §5/§8/§10's hard-tech
 subparts "N/A (software)" rather than forcing them.
 
-Every section: claims carry inline source citations `[source: <url or
-description>]`. Claims that failed adversarial verification appear with
+Every section: claims carry inline source citations
+`[source: <url or description>, primary|secondary]` — the source type is
+part of the citation, matching the skill's evidence contract, not an
+optional flourish. Claims that failed adversarial verification appear with
 `⚠ DISPUTED:` and the refuting evidence. No placeholder text ("TBD",
 "$XX", "could not verify" without naming what was searched).
 

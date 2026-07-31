@@ -930,3 +930,14 @@ def test_calibration_summary_quiet_when_gates_discriminate() -> None:
     text = calibration_summary(clean)
     assert "NOT DISCRIMINATING" not in text
     assert "gates: (none fired)" in text
+
+
+def test_dedupe_never_merges_opposite_polarity_claims() -> None:
+    """Adversarial-review finding: shared-topic flags with flipped negation
+    are opposite claims, not paraphrases."""
+    flags = [
+        "No gross margin disclosure for a hybrid HW/SW business",
+        "Gross margin for the hybrid HW/SW business fully disclosed and healthy",
+    ]
+    result = dedupe_red_flags(flags)
+    assert len(result) == 2

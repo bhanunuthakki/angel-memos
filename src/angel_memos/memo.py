@@ -450,7 +450,11 @@ def _generate_long_memo(
                 purpose=Purpose.LONG_MEMO,
                 image_paths=al_pngs + deck_pngs,
             )
-            missing = _validate_long_memo(memo_md)
+            missing = _validate_long_memo(
+                memo_md,
+                has_benchmarks=bool(decision.benchmarks),
+                has_scenarios=bool(decision.scenarios),
+            )
             if not missing:
                 return memo_md
             last_problem = "; ".join(missing)
@@ -466,15 +470,29 @@ _REQUIRED_MEMO_SECTIONS: tuple[str, ...] = tuple(f"## {n}." for n in range(1, 10
 _MIN_MEMO_CHARS = 1500
 
 
-def _validate_long_memo(md: str) -> list[str]:
+def _validate_long_memo(
+    md: str, *, has_benchmarks: bool = False, has_scenarios: bool = False
+) -> list[str]:
     """Return a list of structural problems with a generated memo (empty when
-    it looks like a real 9-section bull/bear memo)."""
+    it looks like a real 9-section bull/bear memo).
+
+    The system prompt's MANDATORY items were previously prose-only — the
+    model could (and did) skip the dated-comparables table and the Net-MoM
+    scenario columns with nothing catching it. These checks are deliberately
+    cheap substring/structure tests, not prose assertions: they verify the
+    contracted tables exist, never their wording."""
     problems: list[str] = []
     if len(md.strip()) < _MIN_MEMO_CHARS:
         problems.append(f"too short ({len(md.strip())} < {_MIN_MEMO_CHARS} chars)")
     missing = [s for s in _REQUIRED_MEMO_SECTIONS if s not in md]
     if missing:
         problems.append("missing sections: " + ", ".join(missing))
+    if has_benchmarks and "Comparable multiples" not in md:
+        problems.append("missing the mandatory 'Comparable multiples (as-of dated)' table")
+    if has_scenarios:
+        section8 = md.partition("## 8.")[2].partition("## 9.")[0]
+        if "Net MoM" not in section8:
+            problems.append("scenario table lacks the mandated Net MoM column")
     return problems
 
 

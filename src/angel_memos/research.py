@@ -212,7 +212,7 @@ def find_comparable_deals(
     stage: Stage,
     product_summary: str,
 ) -> ComparableDeals:
-    """Web-research 2-4 comparable funded companies in the same category
+    """Web-research 2-3 comparable funded companies in the same category
     and stage. ~$0.10 / 60s per call."""
     prompt = build_comparable_deals_prompt(company_name, category_keywords, stage, product_summary)
     return extract_structured(
@@ -253,7 +253,7 @@ def build_comparable_deals_prompt(
         f"Stage: {stage.value}\n"
         f"Category keywords: {keywords}\n"
         f"Product summary: {product_summary}\n\n"
-        "Find 2-4 real comparables in the same category + stage. Run the "
+        "Find 2-3 real comparables in the same category + stage. Run the "
         "WebSearches specified in the system prompt. Return JSON matching "
         "the ComparableDeals schema. Each comp must have at least one "
         "verifiable source — if you can't find anything, return fewer "

@@ -258,9 +258,11 @@ Write that chain in `derivation` and set `exit_value_usd`.
    sitting ahead of this SPV. Sub-1x cells must reflect seniority — a
    senior position over a small stack floors near 1x at modest exits; a
    junior position under a large stack zeros even above total raised.
-6. If the terms summary carries a TERMS PARSE INCOMPLETE warning, the
-   financials verdict MUST open with "NET MATH UNRELIABLE —" and name
-   the missing fields as a kill condition.
+6. If the terms summary carries a TERMS PARSE INCOMPLETE warning, BOTH
+   the financials verdict AND the scenario_analysis verdict MUST open
+   with "NET MATH UNRELIABLE —" and name the missing fields as a kill
+   condition — the scenario chain divides by the same corrupted entry
+   post-money the fee fields came from.
 
 ============================================================================
 
