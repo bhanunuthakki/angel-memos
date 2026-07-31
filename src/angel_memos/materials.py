@@ -170,7 +170,7 @@ def read_text(entry: FileEntry) -> str:
 # redundant work. Invalidate by deleting the cache file.
 # ---------------------------------------------------------------------------
 
-_ANGELLIST_CACHE_FILENAME = ".angellist_cache.json"
+ANGELLIST_CACHE_FILENAME = ".angellist_cache.json"
 _DECK_CACHE_FILENAME = ".deck_content_cache.json"
 
 
@@ -185,7 +185,7 @@ def load_or_parse_angellist(folder: Path, materials: Materials) -> AngelListMeta
     # to import for callers that only need text-loading helpers.
     from angel_memos.angellist import parse_angellist_metadata
 
-    cache_path = folder / _ANGELLIST_CACHE_FILENAME
+    cache_path = folder / ANGELLIST_CACHE_FILENAME
     fingerprint = _source_fingerprint(materials.angellist, materials.deck)
     # Legacy bare-JSON caches are trusted only when no deck exists now (the
     # exact case that could be stale is "cached without a deck, deck present

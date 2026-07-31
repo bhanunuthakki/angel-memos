@@ -37,17 +37,17 @@ emptying and flooring the scoring team factor.
 """
 
 import logging
+import re
 import tempfile
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
-from pypdf import PdfReader
 
 from angel_memos.claude import Purpose, extract_structured
 from angel_memos.models import AngelListMetadata, Stage
-from angel_memos.pdf_utils import rasterize_pdf
+from angel_memos.pdf_utils import rasterize_pdf, read_pdf_text
 
 logger = logging.getLogger(__name__)
 
@@ -167,23 +167,71 @@ def parse_angellist_metadata(al_pdf: Path, deck_pdf: Path | None = None) -> Ange
             deck_pages = rasterize_pdf(deck_pdf, tmp_dir / "deck")
 
         terms = _extract_terms(al_pages)
-        al_text = _read_pdf_text(al_pdf)
+        al_text = read_pdf_text(al_pdf)
         founders = _extract_founders(al_text, al_pages, deck_pages)
 
         combined = {**terms.model_dump(mode="json"), "founders": founders.founders}
         return AngelListMetadata.model_validate(combined)
 
 
-def _read_pdf_text(pdf_path: Path) -> str:
-    """Best-effort text-layer extraction. Returns "" for image-only PDFs (no
-    text layer) or if pypdf can't parse the file — callers treat an empty/short
-    result as 'no usable text' and fall back to vision."""
-    try:
-        reader = PdfReader(str(pdf_path))
-        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
-    except Exception as exc:  # pypdf raises a variety of parse errors on bad PDFs
-        logger.warning("could not read text layer of %s: %s", pdf_path, exc)
-        return ""
+class RoundId(NamedTuple):
+    """A deal's round, as both the canonical stage and the memo's own wording.
+
+    `stage` is what two captures are compared on (so "Series C" and "Series C+"
+    are one round); `label` is the verbatim TERMS string, used where a human
+    reads it — e.g. an ingest folder suffix."""
+
+    stage: Stage
+    label: str
+
+
+# Ordered longest-prefix-first: "pre-seed" must beat "seed", and an explicit
+# "series d"+ maps to growth since the Stage enum stops at series_c.
+_STAGE_PREFIXES: tuple[tuple[re.Pattern[str], Stage], ...] = (
+    (re.compile(r"^pre[-\s]?seed"), Stage.PRE_SEED),
+    (re.compile(r"^seed"), Stage.SEED),
+    (re.compile(r"^series\s*a"), Stage.SERIES_A),
+    (re.compile(r"^series\s*b"), Stage.SERIES_B),
+    (re.compile(r"^series\s*c"), Stage.SERIES_C),
+    (re.compile(r"^(series\s*[d-h]|growth|late[-\s]?stage)"), Stage.GROWTH),
+)
+
+# The TERMS table's Round row, e.g. "Round Series B+". Anchored to a line start
+# so prose ("...entry point. Round was priced earlier this year.") can't match.
+_ROUND_ROW = re.compile(r"(?im)^\s*Round[ \t]+(?P<label>\S[^\n]*?)\s*$")
+
+# How far past the TERMS heading the Round row may sit. The table is a short
+# key/value block; a wider window would start catching narrative prose.
+_TERMS_WINDOW_CHARS = 1500
+
+
+def parse_round(memo_text: str) -> RoundId | None:
+    """The round from an AL memo's extracted text, or None if not determinable.
+
+    Deliberately conservative: it reads only the Round row of the TERMS table
+    and only accepts a label that maps to a known `Stage`. Anything else —
+    no TERMS block (some captures render it as an image), an unrecognised
+    label — returns None so callers treat the round as unknown rather than
+    acting on a guess."""
+    terms = re.search(r"\bTERMS\b", memo_text)
+    if terms is None:
+        return None
+    window = memo_text[terms.start() : terms.start() + _TERMS_WINDOW_CHARS]
+    row = _ROUND_ROW.search(window)
+    if row is None:
+        return None
+    label = row.group("label").strip()
+    normalized = label.casefold()
+    for pattern, stage in _STAGE_PREFIXES:
+        if pattern.search(normalized):
+            return RoundId(stage=stage, label=label)
+    return None
+
+
+def read_round(pdf_path: Path) -> RoundId | None:
+    """The round from an AL memo PDF's text layer, or None when unavailable
+    (image-only capture, unparsable file, or no TERMS table)."""
+    return parse_round(read_pdf_text(pdf_path))
 
 
 def _extract_terms(al_pages: list[Path]) -> _Terms:

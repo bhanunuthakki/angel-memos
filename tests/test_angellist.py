@@ -186,7 +186,7 @@ def test_founders_extracted_from_al_memo_text_layer(
     def fake_read_text(_p: Path) -> str:
         return memo_text
 
-    monkeypatch.setattr(angellist, "_read_pdf_text", fake_read_text)
+    monkeypatch.setattr(angellist, "read_pdf_text", fake_read_text)
 
     def fake_extract(prompt: str, model_type: type[Any], **kwargs: Any) -> Any:
         if model_type is _Terms:
@@ -313,3 +313,70 @@ def test_parse_angellist_against_real_spotai_pdf() -> None:
     assert len(result.founders) >= 3
     # At least one named co-investor (the deck page had Scale / Qualcomm / StepStone)
     assert len(result.co_investors) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Deterministic round parsing (no Claude call) — used by ingest to keep
+# separate rounds of the same company in separate folders.
+# ---------------------------------------------------------------------------
+
+_TERMS_MEMO = """Dusty Robotics
+TERMS
+Investment adviser Platform Advisor, LLC
+Round Series B+
+Instrument Equity
+Estimated round size $15M USD
+Share class Preferred
+Pre-money valuation $120M USD
+"""
+
+
+def test_parse_round_reads_the_terms_row() -> None:
+    found = angellist.parse_round(_TERMS_MEMO)
+
+    assert found is not None
+    assert found.stage is Stage.SERIES_B
+    assert found.label == "Series B+"
+
+
+def test_parse_round_ignores_the_word_round_in_prose() -> None:
+    """A real Dexterity memo says 'Attractive entry point. Round was priced
+    earlier this year.' — a loose match would read that as the round."""
+    prose = (
+        "TERMS\nInvestment adviser Platform Advisor, LLC\nInstrument Equity\n\n"
+        "Attractive entry point. Round was priced earlier this year.\n"
+    )
+
+    assert angellist.parse_round(prose) is None
+
+
+def test_parse_round_without_a_terms_table_is_unknown() -> None:
+    assert angellist.parse_round("Dexterity builds production-grade Physical AI.") is None
+
+
+def test_parse_round_rejects_a_label_outside_the_stage_enum() -> None:
+    assert angellist.parse_round("TERMS\nRound Series ZZ Recapitalization\n") is None
+
+
+def test_parse_round_of_empty_text_layer_is_unknown() -> None:
+    """Image-only AL captures extract to ~nothing; that must read as unknown."""
+    assert angellist.parse_round("") is None
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("Pre-Seed", Stage.PRE_SEED),
+        ("Seed", Stage.SEED),
+        ("Series A", Stage.SERIES_A),
+        ("Series C+", Stage.SERIES_C),
+        ("Series D", Stage.GROWTH),
+        ("Growth", Stage.GROWTH),
+    ],
+)
+def test_parse_round_maps_labels_to_stages(label: str, expected: Stage) -> None:
+    found = angellist.parse_round(f"TERMS\nRound {label}\nInstrument Equity\n")
+
+    assert found is not None
+    assert found.stage is expected
+    assert found.label == label

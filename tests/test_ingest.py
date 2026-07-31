@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from angel_memos import angellist
 from angel_memos.config import Config
 from angel_memos.ingest import (
     JOB_FILENAME,
@@ -17,6 +18,7 @@ from angel_memos.ingest import (
     run_ingest,
     scan_inbox,
 )
+from angel_memos.materials import ANGELLIST_CACHE_FILENAME
 
 
 def _cfg(tmp_path: Path) -> Config:
@@ -464,6 +466,113 @@ def test_deduped_files_still_count_toward_material_presence(tmp_path: Path) -> N
 
     assert result.missing_angellist is False
     assert result.missing_deck is False
+
+
+# ---------------------------------------------------------------------------
+# Round-aware routing: the same company comes back round after round, and a
+# Series B capture must not land on top of the Series A deal's folder.
+# ---------------------------------------------------------------------------
+
+
+def _terms(round_label: str) -> str:
+    return (
+        f"TERMS\nInvestment adviser Platform Advisor, LLC\nRound {round_label}\nInstrument Equity\n"
+    )
+
+
+def _round_drop(inbox: Path, company: str, round_label: str) -> Path:
+    """A drop whose AL memo's text layer names `round_label`."""
+    drop = inbox / company
+    drop.mkdir(parents=True)
+    (drop / f"angellist - {company}.pdf").write_bytes(_terms(round_label).encode())
+    (drop / f"{company} deck.pdf").write_bytes(_payload(f"{company} deck {round_label}"))
+    (drop / JOB_FILENAME).write_text(json.dumps({"company": company, "tier": "none"}))
+    return drop
+
+
+@pytest.fixture
+def text_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Read our fixture PDFs' bytes as their text layer (they are not real
+    PDFs, and the round parse only ever consumes extracted text)."""
+
+    def fake_read_pdf_text(pdf_path: Path) -> str:
+        return pdf_path.read_bytes().decode("utf-8", "ignore")
+
+    monkeypatch.setattr(angellist, "read_pdf_text", fake_read_pdf_text)
+
+
+def test_new_round_lands_in_its_own_folder(tmp_path: Path, text_layer: None) -> None:
+    cfg = _cfg(tmp_path)
+    inbox = tmp_path / "inbox"
+    first = ingest_folder(_round_drop(inbox, "Acme", "Series A"), cfg)
+    second = ingest_folder(_round_drop(inbox, "Acme", "Series B"), cfg)
+
+    assert first.folder.name == "Acme"
+    assert second.folder.name == "Acme (Series B)"
+    assert (first.folder / "angellist - Acme.pdf").is_file()
+    assert (second.folder / "angellist - Acme.pdf").is_file()
+
+
+def test_same_round_merges_into_the_existing_folder(tmp_path: Path, text_layer: None) -> None:
+    cfg = _cfg(tmp_path)
+    inbox = tmp_path / "inbox"
+    first = ingest_folder(_round_drop(inbox, "Acme", "Series A"), cfg)
+    second = ingest_folder(_round_drop(inbox, "Acme", "Series A"), cfg)
+
+    assert second.folder == first.folder
+    assert not (cfg.evaluation_root / "Acme (Series A)").exists()
+
+
+def test_round_variants_are_one_round(tmp_path: Path, text_layer: None) -> None:
+    """'Series C' and 'Series C+' are the same round — the OneNav case. A fork
+    there would scatter one deal across two folders."""
+    cfg = _cfg(tmp_path)
+    inbox = tmp_path / "inbox"
+    first = ingest_folder(_round_drop(inbox, "Acme", "Series C"), cfg)
+    second = ingest_folder(_round_drop(inbox, "Acme", "Series C+"), cfg)
+
+    assert second.folder == first.folder
+
+
+def test_unreadable_incoming_round_merges_rather_than_forks(tmp_path: Path) -> None:
+    """Never fork on ignorance: an image-only capture has no round to read, and
+    a wrong split is worse than a merge the dedupe pass already handles."""
+    cfg = _cfg(tmp_path)
+    inbox = tmp_path / "inbox"
+    first = ingest_folder(_make_drop(inbox, name="Acme"), cfg)
+    second = ingest_folder(_make_drop(inbox, name="Acme"), cfg)
+
+    assert second.folder == first.folder
+    assert [p.name for p in cfg.evaluation_root.iterdir()] == ["Acme"]
+
+
+def test_existing_round_is_read_from_the_angellist_cache(tmp_path: Path, text_layer: None) -> None:
+    """The folder's own AL memo may be image-only (no text layer) while the
+    cache holds the stage from the full extraction — prefer the cache."""
+    cfg = _cfg(tmp_path)
+    dest = cfg.evaluation_root / "Acme"
+    dest.mkdir(parents=True)
+    (dest / "Acme Series C Apr 2026 AL.pdf").write_bytes(b"image-only, no text layer")
+    (dest / ANGELLIST_CACHE_FILENAME).write_text(
+        json.dumps({"company": "Acme", "round_label": "Series C+", "stage": "series_c"}),
+        encoding="utf-8",
+    )
+
+    same = ingest_folder(_round_drop(tmp_path / "inbox", "Acme", "Series C+"), cfg)
+    assert same.folder == dest
+
+    newer = ingest_folder(_round_drop(tmp_path / "inbox2", "Acme", "Series D"), cfg)
+    assert newer.folder.name == "Acme (Series D)"
+
+
+def test_third_round_finds_its_existing_suffixed_folder(tmp_path: Path, text_layer: None) -> None:
+    cfg = _cfg(tmp_path)
+    ingest_folder(_round_drop(tmp_path / "in1", "Acme", "Series A"), cfg)
+    b1 = ingest_folder(_round_drop(tmp_path / "in2", "Acme", "Series B"), cfg)
+    b2 = ingest_folder(_round_drop(tmp_path / "in3", "Acme", "Series B"), cfg)
+
+    assert b2.folder == b1.folder
+    assert sorted(p.name for p in cfg.evaluation_root.iterdir()) == ["Acme", "Acme (Series B)"]
 
 
 # ---------------------------------------------------------------------------

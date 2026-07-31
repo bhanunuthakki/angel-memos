@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import re
 import shutil
@@ -25,7 +26,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from angel_memos.angellist import RoundId, read_round
 from angel_memos.config import Config
+from angel_memos.materials import ANGELLIST_CACHE_FILENAME
+from angel_memos.models import Stage
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +118,7 @@ def ingest_folder(drop: Path, cfg: Config) -> IngestResult:
     exist in the folder is discarded rather than copied under a second name.
     The consumed drop directory is removed."""
     job = JobRequest.model_validate_json((drop / JOB_FILENAME).read_text(encoding="utf-8"))
-    dest = _safe_dest(cfg.evaluation_root, job.company)
+    dest = _resolve_dest(cfg.evaluation_root, job.company, drop)
     dest.mkdir(parents=True, exist_ok=True)
 
     index = _ContentIndex(dest)
@@ -294,6 +298,74 @@ def run_ingest(
     for name in prune_inbox(inbox):
         logger.info("pruned empty drop dir %s", name)
     return results
+
+
+def _resolve_dest(evaluation_root: Path, company: str, drop: Path) -> Path:
+    """The company folder this drop belongs in, splitting rounds apart.
+
+    The same company comes back round after round, and those are separate
+    deals: merging a Series B capture into the Series A folder mixes two sets
+    of terms under one `decision.md`. So when the incoming AL memo names a
+    round that no existing folder holds, this returns a round-suffixed sibling
+    — `Acme (Series B)` — rather than the bare name.
+
+    It forks only on positive evidence of a DIFFERENT round. An unreadable
+    round on either side merges as before, because a wrong split scatters one
+    deal across two folders, which is worse than a merge the byte-dedupe pass
+    already de-duplicates."""
+    base = _safe_dest(evaluation_root, company)
+    if not _holds_files(base):
+        return base
+    incoming = _drop_round(drop)
+    if incoming is None:
+        return base
+
+    unknown: Path | None = None
+    for candidate in [base, *sorted(base.parent.glob(f"{base.name} (*)"))]:
+        if not candidate.is_dir():
+            continue
+        stage = _folder_stage(candidate)
+        if stage == incoming.stage:
+            return candidate
+        if stage is None and unknown is None:
+            unknown = candidate
+    if unknown is not None:
+        return unknown
+    logger.info("%s is a new round (%s); ingesting alongside", company, incoming.label)
+    return _safe_dest(evaluation_root, f"{company} ({incoming.label})")
+
+
+def _holds_files(folder: Path) -> bool:
+    return folder.is_dir() and any(f.is_file() for f in folder.iterdir())
+
+
+def _drop_round(drop: Path) -> RoundId | None:
+    """The round named by the drop's AngelList memo, if it has a text layer."""
+    for entry in sorted(drop.iterdir()):
+        if entry.is_file() and _ANGELLIST_HINT in entry.name.lower():
+            return read_round(entry)
+    return None
+
+
+def _folder_stage(folder: Path) -> Stage | None:
+    """The stage a company folder already holds.
+
+    Prefers `.angellist_cache.json`, whose `stage` came from the full
+    (vision-capable) extraction, over re-reading the PDF text layer — the
+    cache is populated even for image-only memos that have no text to parse."""
+    cached = folder / ANGELLIST_CACHE_FILENAME
+    if cached.is_file():
+        try:
+            raw = json.loads(cached.read_text(encoding="utf-8"))
+            return Stage(raw["stage"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.debug("unusable stage in %s: %s", cached, exc)
+    for entry in sorted(folder.iterdir()):
+        if entry.is_file() and _ANGELLIST_HINT in entry.name.lower():
+            found = read_round(entry)
+            if found is not None:
+                return found.stage
+    return None
 
 
 def _safe_dest(evaluation_root: Path, company: str) -> Path:

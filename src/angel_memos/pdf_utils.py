@@ -11,14 +11,30 @@ Claude via @-reference (which works without Poppler).
 # typing; contain the suppression to this thin wrapper module.
 # pyright: reportUnknownVariableType=false
 
+import logging
 from pathlib import Path
 
 import pypdfium2 as pdfium
 from PIL import Image
+from pypdf import PdfReader
+
+logger = logging.getLogger(__name__)
 
 # 150 DPI is the sweet spot for vision quality vs. file size: text-heavy
 # AL pages are still cleanly OCR-able and a 14-page memo fits in ~5 MB.
 DEFAULT_DPI = 150
+
+
+def read_pdf_text(pdf_path: Path) -> str:
+    """Best-effort text-layer extraction. Returns "" for image-only PDFs (no
+    text layer) or if pypdf can't parse the file — callers treat an empty/short
+    result as 'no usable text' and fall back to vision."""
+    try:
+        reader = PdfReader(str(pdf_path))
+        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as exc:  # pypdf raises a variety of parse errors on bad PDFs
+        logger.warning("could not read text layer of %s: %s", pdf_path, exc)
+        return ""
 
 
 def rasterize_pdf(pdf_path: Path, out_dir: Path, dpi: int = DEFAULT_DPI) -> list[Path]:
