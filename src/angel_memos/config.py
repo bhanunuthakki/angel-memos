@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # come from the URLs shared at design time (Public/Private memo docs).
 _DEFAULT_EVALUATION_ROOT = Path(r"G:\My Drive\Personal Finances\Angel Investing\Evaluation")
 _DEFAULT_PORTFOLIO_ROOT = Path(r"G:\My Drive\Personal Finances\Angel Investing\Portfolio")
+_DEFAULT_PASSED_ROOT = Path(r"G:\My Drive\Personal Finances\Angel Investing\Passed")
 _DEFAULT_PUBLIC_DOC_ID = "1nyFj17M4kktlHD028AVF9D-8zeyGRGKC-MXzHNfXA80"
 _DEFAULT_PRIVATE_DOC_ID = "1Ntm55VRReWGTRz4nxm5jK35T_YOlam0Y_0rIxOmYydw"
 
@@ -27,6 +28,10 @@ class Config(BaseModel):
 
     evaluation_root: Path = Field(default=_DEFAULT_EVALUATION_ROOT)
     portfolio_root: Path = Field(default=_DEFAULT_PORTFOLIO_ROOT)
+    # Archive for deals decided `pass`: `mv Evaluation/<C> Passed/<C>`. Read
+    # for name resolution and calibration scans; never a write destination
+    # for pipeline phases.
+    passed_root: Path = Field(default=_DEFAULT_PASSED_ROOT)
     public_doc_id: str = Field(default=_DEFAULT_PUBLIC_DOC_ID, min_length=1)
     private_doc_id: str = Field(default=_DEFAULT_PRIVATE_DOC_ID, min_length=1)
 

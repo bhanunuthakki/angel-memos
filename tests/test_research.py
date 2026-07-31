@@ -2,18 +2,26 @@
 text rendering. Claude calls themselves get end-to-end coverage via the
 diligence flow on real companies."""
 
+from pathlib import Path
+
 import pytest
 
 from angel_memos.models import Stage
 from angel_memos.research import (
+    RECENT_EVENTS_FILENAME,
+    CompanyEvent,
     ComparableDeals,
     CompetitorComp,
     FounderProfile,
     PriorEmployer,
+    RecentEvents,
     build_comparable_deals_prompt,
     build_founder_profile_prompt,
+    build_recent_events_prompt,
+    load_or_find_events,
     render_comparable_deals_text,
     render_founder_profiles_text,
+    render_recent_events_text,
 )
 
 
@@ -252,3 +260,87 @@ def test_dated_multiple_renders_with_basis_and_date() -> None:
 def test_undated_multiple_is_labeled_undated() -> None:
     comps = _comps(comps=[_comp(valuation_multiple=10.3), _comp(company_name="BetaCo")])
     assert "(UNDATED)" in render_comparable_deals_text(comps)
+
+
+# ---------------------------------------------------------------------------
+# Recent-events sweep: schema, cache decay, and rendering. The sweep exists
+# because a claims-level brief cannot see a customer CEO's "not ready for
+# prime time" quote or a buyer insourcing its way out of the customer pool.
+# ---------------------------------------------------------------------------
+
+
+def _event(**overrides: object) -> CompanyEvent:
+    base: dict[str, object] = {
+        "date": "2026-01",
+        "headline": "Customer CEO: technology 'in the pilot stage, not ready for prime time'",
+        "why_material": "Directly contradicts the deck's production-scale framing.",
+        "source": "finance.yahoo.com interview",
+        "source_type": "secondary",
+    }
+    return CompanyEvent.model_validate(base | overrides)
+
+
+def _events(**overrides: object) -> RecentEvents:
+    base: dict[str, object] = {
+        "company": "Acme",
+        "as_of": "2026-07-31",
+        "events": [_event()],
+        "searches_run": ["Acme news 2025 2026", "Acme CEO interview"],
+    }
+    return RecentEvents.model_validate(base | overrides)
+
+
+def test_empty_sweep_still_records_its_searches() -> None:
+    swept = _events(events=[])
+    text = render_recent_events_text(swept)
+    assert "No material events found" in text
+    assert "Acme news 2025 2026" in text  # evidenced absence, not silence
+
+
+def test_events_render_with_date_source_and_materiality() -> None:
+    text = render_recent_events_text(_events())
+    assert "[2026-01]" in text
+    assert "not ready for prime time" in text
+    assert "Why material:" in text
+
+
+def test_fresh_events_cache_is_reused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import date as _date
+
+    cached = _events(as_of=_date.today().isoformat())
+    (tmp_path / RECENT_EVENTS_FILENAME).write_text(cached.model_dump_json(), encoding="utf-8")
+
+    def boom(*args: object, **kwargs: object) -> RecentEvents:
+        raise AssertionError("fresh cache must not trigger a re-research call")
+
+    monkeypatch.setattr("angel_memos.research.find_recent_events", boom)
+    result = load_or_find_events(tmp_path, "Acme", ["robotics"], [])
+    assert result is not None and result.events[0].date == "2026-01"
+
+
+def test_stale_events_cache_is_refreshed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stale = _events(as_of="2026-01-01")
+    (tmp_path / RECENT_EVENTS_FILENAME).write_text(stale.model_dump_json(), encoding="utf-8")
+    fresh = _events(as_of="2026-07-31", events=[_event(headline="New competitor take-private")])
+
+    def _return_fresh(
+        company_name: str, category_keywords: list[str], anchor_names: list[str]
+    ) -> RecentEvents:
+        return fresh
+
+    monkeypatch.setattr("angel_memos.research.find_recent_events", _return_fresh)
+
+    result = load_or_find_events(tmp_path, "Acme", ["robotics"], [])
+
+    assert result is not None
+    assert result.events[0].headline == "New competitor take-private"
+    on_disk = RecentEvents.model_validate_json(
+        (tmp_path / RECENT_EVENTS_FILENAME).read_text(encoding="utf-8")
+    )
+    assert on_disk.as_of == "2026-07-31"  # cache rewritten
+
+
+def test_recent_events_prompt_names_anchors_and_today() -> None:
+    prompt = build_recent_events_prompt("Acme", ["robotics"], ["FedEx", "Nimble"])
+    assert "FedEx, Nimble" in prompt
+    assert "Acme" in prompt

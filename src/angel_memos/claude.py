@@ -42,6 +42,7 @@ class Purpose(StrEnum):
     DILIGENCE_TOPICS = "diligence_topics"
     FOUNDER_PROFILE = "founder_profile"
     COMPARABLE_DEALS = "comparable_deals"
+    RECENT_EVENTS = "recent_events"
     INVESTOR_GRADE = "investor_grade"
     SCORE_ARCHETYPE = "score_archetype"
     SCORE_TEAM_FIT = "score_team_fit"
@@ -119,6 +120,13 @@ MODEL_ROUTES: dict[Purpose, ModelRoute] = {
         "openai/gpt-5.6-terra",
         "gpt-5.6-terra",
         "Investor grading requires current sourced research.",
+        requires_web=True,
+    ),
+    Purpose.RECENT_EVENTS: ModelRoute(
+        "claude-opus-4-7",
+        "openai/gpt-5.6-terra",
+        "gpt-5.6-terra",
+        "Event discovery (exec quotes, competitor M&A, insourcing) requires live web search.",
         requires_web=True,
     ),
     Purpose.SCORE_MARKET: ModelRoute(

@@ -31,8 +31,10 @@ from angel_memos.scoring import (
     build_report,
     build_report_v2,
     build_summary,
+    calibration_summary,
     coinvestor_score,
     consensus,
+    dedupe_red_flags,
     judge_system_prompt,
     normalized_total,
     render_score_markdown,
@@ -718,3 +720,213 @@ def test_archetype_prompts_use_distinct_evidence_anchors() -> None:
     assert "model-provider dependency" in ai_prompt
     assert "manufacturing process" in hardware_prompt
     assert ai_prompt != hardware_prompt
+
+
+# ---------------------------------------------------------------------------
+# Split evidence gates. The former single OR'd gate fired on 4/4 real deals
+# while every displayed factor read confidence=high — undiagnosable and
+# undiscriminating. Low-confidence and evidence-missing now gate separately,
+# each naming its factors, and evidence-missing caps only at stages where
+# the missing disclosure is stage-inappropriate.
+# ---------------------------------------------------------------------------
+
+
+def _v22_factors(**core_overrides: FactorScore) -> list[FactorScore]:
+    factors = [_factor(name=name, score=75.0, weight=weight) for name, weight in V2_WEIGHTS.items()]
+    for i, factor in enumerate(factors):
+        if factor.name in core_overrides:
+            factors[i] = core_overrides[factor.name]
+    return factors
+
+
+def test_two_low_confidence_core_factors_cap_and_name_themselves() -> None:
+    factors = _v22_factors(
+        **{
+            FactorName.MARKET: _factor(
+                name=FactorName.MARKET,
+                weight=V2_WEIGHTS[FactorName.MARKET],
+                confidence=Confidence.LOW,
+            ),
+            FactorName.DEFENSIBILITY: _factor(
+                name=FactorName.DEFENSIBILITY,
+                weight=V2_WEIGHTS[FactorName.DEFENSIBILITY],
+                confidence=Confidence.LOW,
+            ),
+        }
+    )
+
+    report = build_report_v2(
+        "Acme", "quick", factors, archetype=DealArchetype.AI_SOFTWARE, summary="s"
+    )
+
+    gate = next(g for g in report.gates if g.code == "core_factors_low_confidence")
+    assert gate.band_cap is ScoreBand.CONSIDER
+    assert "market" in gate.rationale and "defensibility" in gate.rationale
+    assert report.effective_band is ScoreBand.CONSIDER
+
+
+def test_critical_evidence_missing_caps_at_late_stage() -> None:
+    factors = _v22_factors(
+        **{
+            FactorName.EXECUTION_CAPITAL: _factor(
+                name=FactorName.EXECUTION_CAPITAL,
+                weight=V2_WEIGHTS[FactorName.EXECUTION_CAPITAL],
+                critical_evidence_missing=True,
+            )
+        }
+    )
+
+    report = build_report_v2(
+        "Acme",
+        "quick",
+        factors,
+        archetype=DealArchetype.AI_SOFTWARE,
+        summary="s",
+        stage=Stage.SERIES_C,
+    )
+
+    gate = next(g for g in report.gates if g.code == "critical_evidence_missing")
+    assert gate.band_cap is ScoreBand.CONSIDER
+    assert "execution_capital" in gate.rationale
+    assert report.effective_band is ScoreBand.CONSIDER
+
+
+@pytest.mark.parametrize("stage", [Stage.PRE_SEED, Stage.SEED, None])
+def test_critical_evidence_missing_is_informational_early_or_unknown(stage: Stage | None) -> None:
+    """A pre-seed missing margin disclosure is normal — the gate reports but
+    does not cap; an unknown stage must not cap either (never punish on
+    ignorance)."""
+    factors = _v22_factors(
+        **{
+            FactorName.COMMERCIAL_EVIDENCE: _factor(
+                name=FactorName.COMMERCIAL_EVIDENCE,
+                weight=V2_WEIGHTS[FactorName.COMMERCIAL_EVIDENCE],
+                critical_evidence_missing=True,
+            )
+        }
+    )
+
+    report = build_report_v2(
+        "Acme",
+        "quick",
+        factors,
+        archetype=DealArchetype.AI_SOFTWARE,
+        summary="s",
+        stage=stage,
+    )
+
+    gate = next(g for g in report.gates if g.code == "critical_evidence_missing")
+    assert gate.band_cap is None
+    assert report.effective_band is report.band  # no cap applied
+    assert report.provisional is True  # still flagged for the reader
+
+
+def test_one_low_confidence_core_factor_does_not_gate() -> None:
+    factors = _v22_factors(
+        **{
+            FactorName.MARKET: _factor(
+                name=FactorName.MARKET,
+                weight=V2_WEIGHTS[FactorName.MARKET],
+                confidence=Confidence.LOW,
+            )
+        }
+    )
+
+    report = build_report_v2(
+        "Acme", "quick", factors, archetype=DealArchetype.AI_SOFTWARE, summary="s"
+    )
+
+    assert all(g.code != "core_factors_low_confidence" for g in report.gates)
+
+
+# ---------------------------------------------------------------------------
+# Red-flag dedup. Paraphrase examples below are verbatim from a real
+# Dexterity score report that carried ~50 flags collapsing to ~12 concerns.
+# ---------------------------------------------------------------------------
+
+
+def test_dedupe_collapses_real_paraphrase_duplicates() -> None:
+    flags = [
+        "All six co-founders are first-time founders with no prior exits — "
+        "execution-at-growth-stage risk",
+        "All six founders are first-time founders with zero prior exits — no "
+        "repeat-founder scar tissue at Series C+ ($1.65B) scale",
+        "Five of six co-founders are first-time founders with no prior exits; "
+        "execution-under-scale leadership weight concentrates on CEO Samir Menon, "
+        "also a first-time founder.",
+    ]
+    result = dedupe_red_flags(flags)
+    assert len(result) == 1
+    assert "[x3 across judges]" in result[0]
+
+
+def test_dedupe_keeps_distinct_concerns_separate() -> None:
+    flags = [
+        "All six co-founders are first-time founders with no prior exits — "
+        "execution-at-growth-stage risk",
+        "Glassdoor sentiment (3.3/5, 42 reviews) flagged early 'inexperienced "
+        "leadership' and technical-lead appointments via founder relationships",
+        "Monopsony risk: a small set of parcel/retail giants (FedEx, UPS, Amazon, "
+        "Walmart) drives most spend and has a history of insourcing robotics",
+    ]
+    result = dedupe_red_flags(flags)
+    assert len(result) == 3
+    assert all("[x" not in f for f in result)
+
+
+def test_dedupe_prefers_the_richest_phrasing() -> None:
+    short = "No gross margin disclosure for a hybrid HW/SW business"
+    rich = (
+        "No gross margin, BOM, install cost, or service-load disclosure for a hybrid "
+        "HW+SW business scaling to thousands of physical robots — the load-bearing "
+        "cost structure is entirely absent from the brief"
+    )
+    result = dedupe_red_flags([short, rich])
+    assert len(result) == 1
+    assert result[0].startswith("No gross margin, BOM")
+
+
+def test_dedupe_preserves_first_seen_order() -> None:
+    flags = ["Alpha risk about pricing power", "Beta risk about churn dynamics"]
+    assert dedupe_red_flags(flags) == flags
+
+
+def test_calibration_summary_flags_a_gate_firing_on_every_deal() -> None:
+    reports = [
+        build_report_v2(
+            f"Co{i}",
+            "quick",
+            _v22_factors(
+                **{
+                    FactorName.MARKET: _factor(
+                        name=FactorName.MARKET,
+                        weight=V2_WEIGHTS[FactorName.MARKET],
+                        confidence=Confidence.LOW,
+                    ),
+                    FactorName.TEAM: _factor(
+                        name=FactorName.TEAM,
+                        weight=V2_WEIGHTS[FactorName.TEAM],
+                        confidence=Confidence.LOW,
+                    ),
+                }
+            ),
+            archetype=DealArchetype.AI_SOFTWARE,
+            summary="s",
+        )
+        for i in range(3)
+    ]
+    text = calibration_summary(reports)
+    assert "core_factors_low_confidence: 3/3 (100%)" in text
+    assert "NOT DISCRIMINATING" in text
+
+
+def test_calibration_summary_quiet_when_gates_discriminate() -> None:
+    clean = [
+        build_report_v2(
+            f"Co{i}", "quick", _v22_factors(), archetype=DealArchetype.AI_SOFTWARE, summary="s"
+        )
+        for i in range(3)
+    ]
+    text = calibration_summary(clean)
+    assert "NOT DISCRIMINATING" not in text
+    assert "gates: (none fired)" in text

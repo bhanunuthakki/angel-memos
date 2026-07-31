@@ -25,6 +25,7 @@ Outputs are cached per-company so re-running diligence doesn't repeat the
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Literal
 
@@ -311,6 +312,144 @@ def load_or_find_comps(
     result = find_comparable_deals(company_name, category_keywords, stage, product_summary)
     cache_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Recent events — the discovery pass the claims-level brief lacks.
+# ---------------------------------------------------------------------------
+
+RECENT_EVENTS_FILENAME = ".recent_events_cache.json"
+
+# Events go stale in a way founder pedigrees don't; re-research after this.
+_EVENTS_MAX_AGE_DAYS = 30
+
+
+class CompanyEvent(BaseModel):
+    """One thesis-material event found on the public web."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    date: str = Field(min_length=1)  # "2026-01" / "Jan 2026" — as precise as sourced
+    headline: str = Field(min_length=1)  # one line, factual
+    why_material: str = Field(min_length=1)  # ties the event to the investment thesis
+    source: str = Field(min_length=1)
+    source_type: Literal["primary", "secondary"]
+
+
+class RecentEvents(BaseModel):
+    """Web-researched event sweep for one company and its buyer/competitor
+    orbit. `searches_run` makes an empty result evidenced ("nothing found
+    after searching X, Y") instead of indistinguishable from "never looked" —
+    the exact gap that let a CEO's 'not ready for prime time' quote and a
+    buyer's insourcing acquisition go unseen by a claims-level brief."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    company: str = Field(min_length=1)
+    as_of: str = Field(min_length=1)  # date the sweep ran, "YYYY-MM-DD"
+    events: list[CompanyEvent] = Field(default=[], max_length=6)
+    searches_run: list[str] = Field(min_length=1, max_length=8)
+
+
+_RECENT_EVENTS_SYSTEM_PROMPT = """You are sweeping the last ~18 months of
+public record for events MATERIAL to an angel investment in a target
+company. The diligence brief already analyzes the company's own claims;
+your job is what the claims don't volunteer.
+
+REQUIRED searches (adapt names; record each in `searches_run`):
+  1. "<company> news <last year> <this year>"
+  2. "<company> CEO OR founder interview"
+  3. "<anchor customer> <category> automation strategy" — what the
+     customer's OWN executives say about the technology's maturity and
+     their vendor strategy
+  4. "<category> acquisition OR insourcing OR shutdown <this year>"
+  5. "<top competitor> funding OR contract <this year>"
+
+MATERIAL means it could move the investment decision:
+  - Executive quotes about maturity/timelines (a customer CEO saying
+    "pilot stage, not ready" outweighs any deck claim)
+  - A buyer insourcing (acquiring its own capability = exiting the
+    customer pool)
+  - Competitor funding/M&A that re-prices the category (a take-private
+    at a fraction of the target's mark)
+  - Customer wins/losses, exec departures, safety/regulatory incidents
+
+NOT material (do not include): product-award PR, minor partnership
+announcements, listicles, opinion pieces without new facts.
+
+Each event: one-line factual headline, a date as precise as the source
+supports, why_material tied to THIS deal's thesis, and its source.
+Cap at the 6 most material. If the sweep finds nothing material, return
+an empty events list — searches_run proves the sweep happened."""
+
+
+def find_recent_events(
+    company_name: str,
+    category_keywords: list[str],
+    anchor_names: list[str],
+) -> RecentEvents:
+    """Web-sweep material events for one company. ~$0.10 / 60s per call."""
+    prompt = build_recent_events_prompt(company_name, category_keywords, anchor_names)
+    return extract_structured(
+        prompt,
+        RecentEvents,
+        purpose=Purpose.RECENT_EVENTS,
+        system_prompt=_RECENT_EVENTS_SYSTEM_PROMPT,
+    )
+
+
+def load_or_find_events(
+    folder: Path,
+    company_name: str,
+    category_keywords: list[str],
+    anchor_names: list[str],
+) -> RecentEvents | None:
+    """Cached event sweep, re-run when the cache is older than
+    `_EVENTS_MAX_AGE_DAYS` — events, unlike founder pedigrees, decay."""
+    cache_path = folder / RECENT_EVENTS_FILENAME
+    if cache_path.is_file():
+        cached = RecentEvents.model_validate_json(cache_path.read_text(encoding="utf-8"))
+        try:
+            age = (date.today() - date.fromisoformat(cached.as_of)).days
+        except ValueError:
+            age = _EVENTS_MAX_AGE_DAYS + 1  # unparsable as_of: refresh
+        if age <= _EVENTS_MAX_AGE_DAYS:
+            return cached
+    result = find_recent_events(company_name, category_keywords, anchor_names)
+    cache_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    return result
+
+
+def build_recent_events_prompt(
+    company_name: str,
+    category_keywords: list[str],
+    anchor_names: list[str],
+) -> str:
+    """Construct the user-prompt body for the event sweep."""
+    anchors = ", ".join(anchor_names) if anchor_names else "(none named)"
+    return (
+        f"Target company: {company_name}\n"
+        f"Category: {', '.join(category_keywords)}\n"
+        f"Anchor customers / co-investors to sweep: {anchors}\n"
+        f"Today's date for as_of: {date.today().isoformat()}\n\n"
+        "Run the searches specified in the system prompt. Return JSON "
+        "matching the RecentEvents schema; record every search in "
+        "searches_run."
+    )
+
+
+def render_recent_events_text(events: RecentEvents | None) -> str:
+    """Render the event sweep as dense text for the synthesis prompt."""
+    if events is None:
+        return "RECENT EVENTS: (sweep unavailable)"
+    parts = [f"RECENT EVENTS (web-swept {events.as_of}):"]
+    if not events.events:
+        parts.append("  No material events found. Searches run: " + "; ".join(events.searches_run))
+        return "\n".join(parts)
+    for e in events.events:
+        parts.append(f"  - [{e.date}] {e.headline} ({e.source_type}: {e.source})")
+        parts.append(f"      Why material: {e.why_material}")
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------

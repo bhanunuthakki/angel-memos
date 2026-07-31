@@ -29,6 +29,7 @@ makes the call. Nothing here writes decision.md.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from datetime import date
 from enum import StrEnum
@@ -37,12 +38,21 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from angel_memos.models import Stage
+
 if TYPE_CHECKING:
     from pathlib import Path
 
     from angel_memos.models import AngelListMetadata
 
 _WEIGHT_TOLERANCE = 1e-3
+
+# Stages late enough that missing quantitative disclosure (margins, runway,
+# retention) is an underwriting failure rather than a stage-normal gap; the
+# critical_evidence_missing gate only caps the band at these stages.
+_EVIDENCE_DEMANDING_STAGES: frozenset[Stage] = frozenset(
+    {Stage.SERIES_A, Stage.SERIES_B, Stage.SERIES_C, Stage.GROWTH}
+)
 
 
 class Confidence(StrEnum):
@@ -599,6 +609,131 @@ def build_report(
     )
 
 
+# Function words carrying no red-flag meaning; stripped before similarity so
+# "the founders have no exits" and "founders with zero exits" compare on
+# content tokens only.
+_FLAG_STOPWORDS: frozenset[str] = frozenset(
+    [
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "but",
+        "by",
+        "for",
+        "from",
+        "has",
+        "have",
+        "in",
+        "is",
+        "it",
+        "its",
+        "no",
+        "not",
+        "of",
+        "on",
+        "or",
+        "the",
+        "their",
+        "this",
+        "to",
+        "with",
+        "without",
+    ]
+)
+
+
+def _flag_tokens(flag: str) -> frozenset[str]:
+    """Content tokens for similarity: hyphenated compounds split into their
+    words (judges vary between "co-founders" and "founders",
+    "execution-at-growth-stage" and "execution under scale"), decimals stay
+    whole ("3.3"), and plural 's' is stripped so exits/exit compare equal."""
+    words = re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", flag.casefold())
+    content = (w[:-1] if len(w) > 3 and w.endswith("s") else w for w in words)
+    return frozenset(w for w in content if w not in _FLAG_STOPWORDS)
+
+
+def dedupe_red_flags(flags: Sequence[str], *, threshold: float = 0.45) -> list[str]:
+    """Collapse paraphrase-duplicate red flags.
+
+    Independent judge samples restate the same concern in different words
+    ("all six are first-time founders with no exits" x5), and exact-string
+    dedup let every paraphrase through — a real report carried ~50 flags that
+    were ~12 distinct, burying the signal. Similarity is the overlap
+    coefficient on stopword-filtered content tokens (|A∩B| / min(|A|,|B|)),
+    which — unlike Jaccard — still matches when one judge wrote a short flag
+    and another an elaborated one. 0.45 tolerates heavy elaboration around a
+    shared core; the distinct-concern regression tests bound the over-merge
+    risk. Greedy first-seen clustering; the richest
+    (longest) member represents the cluster, annotated with the duplicate
+    count so repetition still reads as emphasis."""
+    clusters: list[tuple[frozenset[str], str, int]] = []  # (tokens, best_text, count)
+    for flag in flags:
+        tokens = _flag_tokens(flag)
+        for i, (seen, best, count) in enumerate(clusters):
+            smaller = min(len(tokens), len(seen))
+            if smaller == 0:
+                continue
+            if len(tokens & seen) / smaller >= threshold:
+                # Union the token sets so the cluster attracts later variants
+                # that overlap either phrasing.
+                clusters[i] = (
+                    seen | tokens,
+                    best if len(best) >= len(flag) else flag,
+                    count + 1,
+                )
+                break
+        else:
+            clusters.append((tokens, flag, 1))
+    return [
+        text if count == 1 else f"{text} [x{count} across judges]" for _, text, count in clusters
+    ]
+
+
+def calibration_summary(reports: Sequence[ScoreReport]) -> str:
+    """Distribution report over existing score reports — the cheap monitor
+    for gate/band calibration.
+
+    A gate that fires on every deal discriminates nothing (the combined
+    evidence gate fired 4/4 before being split); this summary makes that
+    visible without re-running any LLM scoring. Grouped by rubric version so
+    a rubric change's effect on the distribution is directly comparable."""
+    if not reports:
+        return "No score reports found."
+    lines: list[str] = []
+    by_version: dict[str, list[ScoreReport]] = {}
+    for report in reports:
+        by_version.setdefault(report.rubric_version.value, []).append(report)
+    for version in sorted(by_version):
+        group = by_version[version]
+        n = len(group)
+        lines.append(f"rubric {version} — {n} report(s)")
+        band_views: tuple[tuple[str, Callable[[ScoreReport], ScoreBand]], ...] = (
+            ("band", lambda r: r.band),
+            ("effective", lambda r: r.effective_band or r.band),
+        )
+        for label, band_of in band_views:
+            counts: dict[str, int] = {}
+            for report in group:
+                counts[band_of(report).value] = counts.get(band_of(report).value, 0) + 1
+            dist = ", ".join(f"{band}={count}" for band, count in sorted(counts.items()))
+            lines.append(f"  {label}: {dist}")
+        gate_counts: dict[str, int] = {}
+        for report in group:
+            for gate in report.gates:
+                gate_counts[gate.code] = gate_counts.get(gate.code, 0) + 1
+        if not gate_counts:
+            lines.append("  gates: (none fired)")
+        for code, count in sorted(gate_counts.items(), key=lambda kv: -kv[1]):
+            rate = count / n
+            note = "  <- NOT DISCRIMINATING" if n >= 3 and rate >= 0.8 else ""
+            lines.append(f"  gate {code}: {count}/{n} ({rate:.0%}){note}")
+    return "\n".join(lines)
+
+
 _BAND_RANK: dict[ScoreBand, int] = {
     ScoreBand.PASS: 0,
     ScoreBand.BORDERLINE: 1,
@@ -625,6 +760,7 @@ def build_report_v2(
     ] = RubricVersion.V2_2,
     generated_on: date | None = None,
     deck_present: bool = True,
+    stage: Stage | None = None,
 ) -> ScoreReport:
     """Assemble an archetype-aware score with evidence gates.
 
@@ -700,17 +836,49 @@ def build_report_v2(
         for factor in factor_list
         if factor.name in core_names and factor.critical_evidence_missing
     ]
-    if len(low_core) >= 2 or critical_missing:
-        gate = ScoreGate(
-            code="core_evidence_low_confidence",
-            rationale=(
-                "Two or more core factors are low-confidence, or a judge found "
-                "critical evidence missing."
-            ),
-            band_cap=ScoreBand.CONSIDER,
+    # Split gates (formerly one OR'd `core_evidence_low_confidence`): the
+    # combined gate fired on 4/4 real deals while every displayed factor read
+    # confidence=high — the reader could not tell WHICH clause fired or which
+    # factor tripped it, making the cap undiagnosable and undiscriminating.
+    if len(low_core) >= 2:
+        gates.append(
+            ScoreGate(
+                code="core_factors_low_confidence",
+                rationale=(
+                    "Low-confidence core factors: "
+                    + ", ".join(f.name.value for f in low_core)
+                    + "."
+                ),
+                band_cap=ScoreBand.CONSIDER,
+            )
         )
-        gates.append(gate)
         effective_band = _cap_band(effective_band, ScoreBand.CONSIDER)
+    if critical_missing:
+        # Stage-conditional cap: a Series C+ with no margin/runway disclosure
+        # is damning; a pre-seed missing the same numbers is normal. Judges
+        # are already told "stage-appropriate", but empirically the flag fires
+        # at every stage, so the deterministic layer applies the stage test.
+        # Early-stage (or unknown-stage) deals keep an informational gate with
+        # no band cap.
+        late_stage = stage in _EVIDENCE_DEMANDING_STAGES
+        gates.append(
+            ScoreGate(
+                code="critical_evidence_missing",
+                rationale=(
+                    "Judge-flagged missing critical evidence on: "
+                    + ", ".join(f.name.value for f in critical_missing)
+                    + (
+                        "."
+                        if late_stage
+                        else ". No band cap: missing quantitative"
+                        " disclosure is stage-normal this early."
+                    )
+                ),
+                band_cap=ScoreBand.CONSIDER if late_stage else None,
+            )
+        )
+        if late_stage:
+            effective_band = _cap_band(effective_band, ScoreBand.CONSIDER)
 
     if not deck_present:
         gate = ScoreGate(
@@ -725,9 +893,8 @@ def build_report_v2(
     if not deck_present:
         flags.append("No pitch deck at scoring time - core factors used AL terms only.")
     for factor in factor_list:
-        for flag in factor.red_flags:
-            if flag not in flags:
-                flags.append(flag)
+        flags.extend(factor.red_flags)
+    flags = dedupe_red_flags(flags)
 
     return ScoreReport(
         company=company,
@@ -1470,6 +1637,7 @@ def run_score_phase(
                 rubric_version,
             ),
             deck_present=materials.deck is not None,
+            stage=al.stage,
         )
     else:
         terms, terms_confidence, terms_rationale = valuation_score(

@@ -171,6 +171,20 @@ def parse_angellist_metadata(al_pdf: Path, deck_pdf: Path | None = None) -> Ange
         founders = _extract_founders(al_text, al_pages, deck_pages)
 
         combined = {**terms.model_dump(mode="json"), "founders": founders.founders}
+        # The deterministic TERMS-row parse is authoritative for `stage` when
+        # a text layer exists: the vision pass has mapped "Series C+" to
+        # `growth` while parse_round maps it to `series_c`, and ingest's
+        # round-aware folder routing compares against the cached stage — a
+        # disagreement would fork one deal across two folders.
+        parsed = parse_round(al_text)
+        if parsed is not None and parsed.stage.value != combined["stage"]:
+            logger.info(
+                "stage override: TERMS row %r parses to %s; vision said %s",
+                parsed.label,
+                parsed.stage.value,
+                combined["stage"],
+            )
+            combined["stage"] = parsed.stage.value
         return AngelListMetadata.model_validate(combined)
 
 

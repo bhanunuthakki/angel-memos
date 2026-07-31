@@ -39,6 +39,7 @@ from angel_memos.scoring import (
     DealArchetype,
     RubricVersion,
     ScoreReport,
+    calibration_summary,
     run_score_phase,
 )
 
@@ -194,6 +195,27 @@ def score(
         )
     for label, path in outputs.items():
         click.echo(f"  {label}: {path}")
+
+
+@main.command(name="score-eval")
+def score_eval() -> None:
+    """Calibration monitor: gate fire-rates and band distribution across every
+    existing score_report.json (Evaluation, Portfolio, Passed). No LLM calls.
+    A gate firing on ~every deal discriminates nothing and needs retuning."""
+    cfg = load_config()
+    reports: list[ScoreReport] = []
+    skipped = 0
+    for root in (cfg.evaluation_root, cfg.portfolio_root, cfg.passed_root):
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*/score_report.json")):
+            try:
+                reports.append(ScoreReport.model_validate_json(path.read_text(encoding="utf-8")))
+            except Exception:
+                skipped += 1
+    click.echo(calibration_summary(reports))
+    if skipped:
+        click.echo(f"  ({skipped} report(s) skipped: legacy/invalid contract)")
 
 
 @main.command()
@@ -420,6 +442,17 @@ def _resolve_company_folder(company: str, override: Path | None, cfg: Config) ->
 
     if evaluation_folder.is_dir():
         return evaluation_folder
+
+    # Archived passes resolve last: an active Evaluation/Portfolio deal always
+    # wins over its archive, but `angel-memos memo Dexterity` after a
+    # pass-and-move must not error with "no folder".
+    passed_folder = cfg.passed_root / company
+    if passed_folder.is_dir():
+        click.echo(
+            f"  NOTE: '{company}' resolved from the Passed archive ({passed_folder}).",
+            err=True,
+        )
+        return passed_folder
 
     matches = _flat_matches(cfg.evaluation_root, company)
     if not matches:

@@ -3,7 +3,8 @@ auto-migration matching."""
 
 from pathlib import Path
 
-from angel_memos.cli import _flat_matches
+from angel_memos.cli import _flat_matches, _resolve_company_folder
+from angel_memos.config import Config
 
 
 def _touch(path: Path) -> None:
@@ -40,3 +41,34 @@ def test_flat_matches_ignores_non_material_suffixes(tmp_path: Path) -> None:
     (tmp_path / "Acme spreadsheet.xlsx").write_bytes(b"x")
     matches = {p.name for p in _flat_matches(tmp_path, "Acme")}
     assert matches == {"Acme AL.pdf"}
+
+
+# ---------------------------------------------------------------------------
+# Name resolution across the three roots: active deals win over the archive,
+# but an archived pass must still resolve by name.
+# ---------------------------------------------------------------------------
+
+
+def _cfg(tmp_path: Path) -> Config:
+    return Config(
+        evaluation_root=tmp_path / "Evaluation",
+        portfolio_root=tmp_path / "Portfolio",
+        passed_root=tmp_path / "Passed",
+    )
+
+
+def test_passed_folder_resolves_when_no_active_deal(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    archived = cfg.passed_root / "OneNav"
+    archived.mkdir(parents=True)
+    assert _resolve_company_folder("OneNav", None, cfg) == archived
+
+
+def test_evaluation_wins_over_passed(tmp_path: Path) -> None:
+    """A re-opened deal (fresh Evaluation capture) must not resolve to the
+    stale archive."""
+    cfg = _cfg(tmp_path)
+    (cfg.passed_root / "Acme").mkdir(parents=True)
+    active = cfg.evaluation_root / "Acme"
+    active.mkdir(parents=True)
+    assert _resolve_company_folder("Acme", None, cfg) == active

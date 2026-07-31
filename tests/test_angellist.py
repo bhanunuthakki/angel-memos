@@ -380,3 +380,53 @@ def test_parse_round_maps_labels_to_stages(label: str, expected: Stage) -> None:
     assert found is not None
     assert found.stage is expected
     assert found.label == label
+
+
+def test_deterministic_terms_row_overrides_vision_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Dexterity case: vision mapped 'Series C+' to growth while the
+    deterministic parser (which ingest's folder routing uses) maps it to
+    series_c — the parse is authoritative so cache and routing agree."""
+    pdf = tmp_path / "angellist - Acme.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%stub\n")
+
+    def fake_extract(prompt: str, model_type: type[Any], **kwargs: Any) -> Any:
+        if model_type is _Terms:
+            return _Terms.model_validate(
+                _TERMS_DATA | {"round_label": "Series C+", "stage": "growth"}
+            )
+        return _Founders(founders=["Jane Doe"])
+
+    def _fake_text(_p: Path) -> str:
+        return "TERMS\nRound Series C+\nInstrument Equity\n"
+
+    monkeypatch.setattr(angellist, "rasterize_pdf", _one_page_rasterize)
+    monkeypatch.setattr(angellist, "extract_structured", fake_extract)
+    monkeypatch.setattr(angellist, "read_pdf_text", _fake_text)
+
+    result = parse_angellist_metadata(pdf)
+    assert result.stage is Stage.SERIES_C
+
+
+def test_vision_stage_stands_when_no_text_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pdf = tmp_path / "angellist - Acme.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%stub\n")
+
+    def fake_extract(prompt: str, model_type: type[Any], **kwargs: Any) -> Any:
+        if model_type is _Terms:
+            return _Terms.model_validate(_TERMS_DATA | {"stage": "growth"})
+        return _Founders(founders=["Jane Doe"])
+
+    monkeypatch.setattr(angellist, "rasterize_pdf", _one_page_rasterize)
+    monkeypatch.setattr(angellist, "extract_structured", fake_extract)
+
+    def _empty_text(_p: Path) -> str:
+        return ""
+
+    monkeypatch.setattr(angellist, "read_pdf_text", _empty_text)
+
+    result = parse_angellist_metadata(pdf)
+    assert result.stage is Stage.GROWTH

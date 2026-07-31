@@ -42,10 +42,13 @@ from angel_memos.pdf_utils import rasterize_pdf
 from angel_memos.research import (
     ComparableDeals,
     FounderProfile,
+    RecentEvents,
     load_or_find_comps,
+    load_or_find_events,
     load_or_profile_founders,
     render_comparable_deals_text,
     render_founder_profiles_text,
+    render_recent_events_text,
 )
 
 _SYSTEM_PROMPT = """You produce ADVERSARIAL, DENSE diligence on an angel-
@@ -160,8 +163,27 @@ calls:
     COMPETITIVE LANDSCAPE AND FINANCIALS SECTIONS. Name comps inline in
     bull/bear points to anchor valuation discussion.
 
+  - `RECENT EVENTS (web-swept ...):` — material events from the last ~18
+    months: executive quotes on maturity, buyer insourcing, competitor
+    M&A/funding, customer wins/losses. AN EVENT OUTWEIGHS A DECK CLAIM
+    ON THE SAME TOPIC (a customer CEO saying "pilot stage" beats the
+    deck's "production scale"). Work each material event into the
+    relevant section's bear or bull column; never leave one unused.
+
 If pre-research returned nothing useful, that's a kill condition or a
 top-priority — don't paper over with a placeholder.
+
+EVIDENCE UNIVERSE — state it, don't imply completeness. The final
+verdict_and_open_questions section must end with one line naming what
+this brief's evidence covered: "Evidence universe: deal materials +
+founder/comps/events web passes; no expert calls, no data room." A
+reader must never mistake a quick screen for deep diligence.
+
+MATERIALITY RULE for verification asks: a private company doing <1-2%
+of a megacap customer's revenue will NEVER appear in that customer's
+10-K/10-Q — its absence from filings is not evidence, and "confirm via
+<megacap> filings" is a BANNED ask. Route the same question through
+executive interviews, trade press, or the customer's own newsroom.
 
 ============================================================================
 THE 9 STANDARD SECTIONS — each gets bull / bear / verdict / kill
@@ -281,6 +303,14 @@ def run_diligence(folder: Path) -> DiligenceTopics:
         angellist.stage,
         product_summary,
     )
+    # Event discovery: exec quotes, buyer insourcing, competitor M&A — the
+    # facts the deck doesn't volunteer and a claims-level debate can't see.
+    events = load_or_find_events(
+        folder,
+        angellist.company,
+        category_keywords,
+        anchor_names=angellist.co_investors + _named_anchors(deck_content),
+    )
 
     # Heavy synthesis pass — text-heavy with deck images as fallback.
     with tempfile.TemporaryDirectory(prefix="angel_memos_diligence_") as tmp_str:
@@ -297,6 +327,7 @@ def run_diligence(folder: Path) -> DiligenceTopics:
             deck_content,
             founder_profiles,
             comps,
+            events,
         )
         return extract_structured(
             prompt,
@@ -618,6 +649,13 @@ def _format_mom(mom: float) -> str:
     return f"{mom:.1f}x"
 
 
+def _named_anchors(deck_content: DeckContent | None) -> list[str]:
+    """Competitor/customer names worth sweeping for events, from the deck."""
+    if deck_content is None:
+        return []
+    return list(deck_content.competitors_mentioned)[:4]
+
+
 def _format_prompt(
     al_pngs: list[Path],
     deck_pngs: list[Path],
@@ -626,6 +664,7 @@ def _format_prompt(
     deck_content: DeckContent | None,
     founder_profiles: list[FounderProfile],
     comps: ComparableDeals | None,
+    events: RecentEvents | None = None,
 ) -> str:
     al_refs = "\n".join(f"@{p.as_posix()}" for p in al_pngs)
     deck_refs = "\n".join(f"@{p.as_posix()}" for p in deck_pngs)
@@ -688,6 +727,7 @@ def _format_prompt(
     # should treat them as ground truth and avoid re-doing the research.
     sections.append(render_founder_profiles_text(founder_profiles))
     sections.append(render_comparable_deals_text(comps))
+    sections.append(render_recent_events_text(events))
 
     sections.extend(
         [
