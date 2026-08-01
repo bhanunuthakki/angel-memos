@@ -332,3 +332,51 @@ def test_pass_decision_without_tables_still_validates() -> None:
 def test_decisionless_validation_keeps_structural_checks_only() -> None:
     assert _validate_long_memo(_memo_md(s7="", s8="")) == []
     assert _validate_long_memo("too short") != []
+
+
+def test_prose_mentions_without_table_rows_fail() -> None:
+    """Adversarial re-grade finding: the right names and numbers scattered in
+    section PROSE (no table rows) must not satisfy the mandate."""
+    s7 = (
+        "Comparable multiples (as-of dated) are worth noting: Symbotic sits "
+        "around 10.3 times revenue as of 2026-07-31, and Berkshire Grey at "
+        "5.7 times, undated, though we do not build a formal table here."
+    )
+    s8 = (
+        "Net MoM commentary: in the Zero scenario (weight 20%) the company "
+        "fails; Slow Grind (30%), Base (30%), Bull (15%), Generational (5%)."
+    )
+    problems = _validate_long_memo(_memo_md(s7=s7, s8=s8), decision=_arr_decision())
+    assert any("Symbotic" in p and "table row" in p for p in problems)
+    assert any("Zero" in p and "table row" in p for p in problems)
+
+
+def test_decimal_percent_formatting_is_accepted() -> None:
+    """Adversarial re-grade finding: "20.0%" style column alignment is a
+    legitimate rendering and must not be a production-blocking false reject."""
+    s8 = (
+        "| Scenario | Probability | Key Assumptions | Gross | Net MoM |\n"
+        "|---|---|---|---|---|\n"
+        "| Zero | 20.0% | fails | 0x | 0x |\n"
+        "| Slow Grind | 30.0% | bundled | 1.2x | 1.0x |\n"
+        "| Base | 30.0% | durable | 4x | 3.2x |\n"
+        "| Bull | 15.0% | leader | 8x | 6.1x |\n"
+        "| Generational | 5.0% | clearinghouse | 15x | 11x |\n"
+    )
+    assert _validate_long_memo(_memo_md(s8=s8), decision=_arr_decision()) == []
+
+
+def test_trailing_decimal_multiple_is_accepted() -> None:
+    """ "10.30x" parses to the same float as 10.3 and must match."""
+    s7 = _COMPLIANT_S7.replace("10.3x", "10.30x")
+    assert _validate_long_memo(_memo_md(s7=s7), decision=_arr_decision()) == []
+
+
+def test_gross_mom_cell_cannot_satisfy_probability() -> None:
+    """A row whose percent is wrong must fail even when another cell's
+    number ("0.2x" gross) coincidentally equals the decimal probability."""
+    s8 = _COMPLIANT_S8.replace(
+        "| Zero | 20% | fails | 0x | 0x |", "| Zero | 45% | fails | 0.2x | 0x |"
+    )
+    problems = _validate_long_memo(_memo_md(s8=s8), decision=_arr_decision())
+    assert any("Zero" in p and "probability" in p for p in problems)

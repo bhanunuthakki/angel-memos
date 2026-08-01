@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -476,25 +478,42 @@ _BENCHMARK_MULTIPLE_FIELDS: tuple[str, ...] = (
 )
 
 
-def _number_variants(value: float) -> tuple[str, ...]:
-    """Renderings a memo may legitimately use for a numeric value: "12",
-    "12.0", "12x" is covered by substring since "12" is. Tolerant of format,
-    intolerant of a different number."""
-    variants = {f"{value:g}"}
-    if value == int(value):
-        variants.add(str(int(value)))
-    else:
-        variants.add(f"{value:.1f}")
-    return tuple(variants)
+_NUMBER_TOKEN = re.compile(r"\d+(?:\.\d+)?")
+_PERCENT_TOKEN = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 
-def _probability_variants(probability: float) -> tuple[str, ...]:
-    """Both percent ("25%", "25 %") and decimal ("0.25") renderings."""
-    pct = probability * 100
-    out = {f"{pct:g}%", f"{pct:g} %", f"{probability:g}"}
-    if pct == int(pct):
-        out.add(f"{int(pct)}%")
-    return tuple(out)
+def _table_rows(section: str) -> list[str]:
+    """Markdown table rows in a section: lines with at least two pipes."""
+    return [line for line in section.splitlines() if line.count("|") >= 2]
+
+
+def _row_for(name: str, rows: list[str]) -> str | None:
+    """First table row mentioning `name` (case-insensitive)."""
+    needle = name.casefold()
+    return next((row for row in rows if needle in row.casefold()), None)
+
+
+def _row_has_number(row: str, target: float) -> bool:
+    """True when any numeric token in the row equals `target` — parsed and
+    compared as floats so "10.3", "10.30", and "10.3x" all match 10.3 and a
+    different number never does."""
+    return any(
+        math.isclose(float(tok), target, rel_tol=1e-3, abs_tol=0.005)
+        for tok in _NUMBER_TOKEN.findall(row)
+    )
+
+
+def _row_has_probability(row: str, probability: float) -> bool:
+    """Percent tokens are authoritative when present ("20%", "20.0 %"); a
+    row with no percent token at all falls back to decimal rendering. The
+    percent-first rule stops a gross-MoM cell like "0.2x" from accidentally
+    satisfying probability 0.2."""
+    percents = [float(tok) for tok in _PERCENT_TOKEN.findall(row)]
+    if percents:
+        return any(math.isclose(pct, probability * 100, abs_tol=0.05) for pct in percents)
+    return any(
+        math.isclose(float(tok), probability, abs_tol=0.0005) for tok in _NUMBER_TOKEN.findall(row)
+    )
 
 
 def _validate_long_memo(md: str, *, decision: Decision | None = None) -> list[str]:
@@ -503,13 +522,12 @@ def _validate_long_memo(md: str, *, decision: Decision | None = None) -> list[st
 
     The system prompt's MANDATORY items were previously prose-only — the
     model could (and did) skip the dated-comparables table and the Net-MoM
-    scenario columns with nothing catching it. With a `decision`, the checks
-    go one level deeper than headings: every benchmark comparable and every
-    scenario (name + probability) must actually appear in its section, and
-    each benchmark must carry its multiple and as-of date (or an explicit
-    UNDATED marker) — so a fabricated or empty table under the right heading
-    fails. Values are matched with format tolerance ("25%" or "0.25"), never
-    prose wording."""
+    scenario columns with nothing catching it. With a `decision`, each
+    benchmark and scenario must appear ON A TABLE ROW in its section with
+    its value on the same row — prose mentions scattered through the section
+    don't count, so a fabricated or missing table fails. Numbers are parsed
+    and compared as floats, so any legitimate rendering ("10.3", "10.30x",
+    "25%", "25.0 %", "0.25") matches and a different number never does."""
     problems: list[str] = []
     if len(md.strip()) < _MIN_MEMO_CHARS:
         problems.append(f"too short ({len(md.strip())} < {_MIN_MEMO_CHARS} chars)")
@@ -519,16 +537,17 @@ def _validate_long_memo(md: str, *, decision: Decision | None = None) -> list[st
     if decision is None:
         return problems
 
-    lower_md = md.casefold()
     if decision.benchmarks:
         if "Comparable multiples" not in md:
             problems.append("missing the mandatory 'Comparable multiples (as-of dated)' table")
-        # Scope value checks to §7 so a name in passing prose elsewhere can't
-        # satisfy the table requirement.
-        section7 = lower_md.partition("## 7.")[2].partition("## 8.")[0]
+        section7 = md.partition("## 7.")[2].partition("## 8.")[0]
+        rows7 = _table_rows(section7)
         for b in decision.benchmarks:
-            if b.comparable.casefold() not in section7:
-                problems.append(f"benchmark comparable '{b.comparable}' absent from section 7")
+            row = _row_for(b.comparable, rows7)
+            if row is None:
+                problems.append(
+                    f"benchmark comparable '{b.comparable}' has no table row in section 7"
+                )
                 continue
             multiple = next(
                 (
@@ -538,33 +557,29 @@ def _validate_long_memo(md: str, *, decision: Decision | None = None) -> list[st
                 ),
                 None,
             )
-            if multiple is not None and not any(v in section7 for v in _number_variants(multiple)):
-                problems.append(
-                    f"benchmark '{b.comparable}' multiple {multiple:g} absent from section 7"
-                )
+            if multiple is not None and not _row_has_number(row, multiple):
+                problems.append(f"benchmark '{b.comparable}' row lacks its multiple {multiple:g}")
             if b.multiple_as_of:
-                if b.multiple_as_of.casefold() not in section7:
+                if b.multiple_as_of.casefold() not in row.casefold():
                     problems.append(
-                        f"benchmark '{b.comparable}' as-of date {b.multiple_as_of} "
-                        "absent from section 7"
+                        f"benchmark '{b.comparable}' row lacks its as-of date {b.multiple_as_of}"
                     )
-            elif "undated" not in section7:
+            elif "undated" not in row.casefold():
                 problems.append(
-                    f"benchmark '{b.comparable}' has no as-of date and section 7 "
+                    f"benchmark '{b.comparable}' has no as-of date and its row "
                     "carries no UNDATED marker"
                 )
     if decision.scenarios:
-        section8_raw = md.partition("## 8.")[2].partition("## 9.")[0]
-        section8 = section8_raw.casefold()
-        if "Net MoM" not in section8_raw:
+        section8 = md.partition("## 8.")[2].partition("## 9.")[0]
+        if "Net MoM" not in section8:
             problems.append("scenario table lacks the mandated Net MoM column")
+        rows8 = _table_rows(section8)
         for s in decision.scenarios:
-            if s.name.casefold() not in section8:
-                problems.append(f"scenario '{s.name}' absent from section 8")
-            elif not any(v in section8 for v in _probability_variants(s.probability)):
-                problems.append(
-                    f"scenario '{s.name}' probability {s.probability:g} absent from section 8"
-                )
+            row = _row_for(s.name, rows8)
+            if row is None:
+                problems.append(f"scenario '{s.name}' has no table row in section 8")
+            elif not _row_has_probability(row, s.probability):
+                problems.append(f"scenario '{s.name}' row lacks its probability {s.probability:g}")
     return problems
 
 
