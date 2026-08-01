@@ -10,6 +10,8 @@ import pytest
 
 from angel_memos.config import Config
 from angel_memos.dashboard import (
+    DealState,
+    StageState,
     decide_launch_command,
     list_deals,
     render_markdown,
@@ -22,7 +24,7 @@ def _stub_pdf(path: Path) -> None:
     path.write_bytes(b"%PDF-1.4\n%stub\n")
 
 
-def _stage(state, key):  # type: ignore[no-untyped-def]
+def _stage(state: DealState, key: str) -> StageState:
     return next(s for s in state.stages if s.key == key)
 
 
