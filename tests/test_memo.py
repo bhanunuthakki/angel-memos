@@ -162,41 +162,173 @@ def test_validate_long_memo_flags_truncated_memo() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Long-memo structural validation: the MANDATORY tables are enforced, not
-# just prompted (adversarial-review finding — a real memo shipped without
-# the comparables table and nothing caught it).
+# Long-memo validation: the MANDATORY tables are enforced against the actual
+# Decision VALUES, not just headings (adversarial-review findings — a real
+# memo shipped without the comparables table, and a fabricated table under
+# the right heading would previously have passed).
 # ---------------------------------------------------------------------------
 
 
-def _memo_md(*, comparables: bool, net_mom: bool) -> str:
+def _arr_decision() -> Decision:
+    return Decision.model_validate(
+        {
+            "company": "Acme",
+            "verdict": "buy",
+            "conviction": "medium",
+            "check_usd": 5_000.0,
+            "post_money_usd": 25_000_000.0,
+            "valuation_method": "arr_multiple",
+            "current_base_metric_usd": 400_000.0,
+            "scenarios": [
+                {
+                    "name": "Zero",
+                    "probability": 0.2,
+                    "future_dilution": 0.6,
+                    "cagr": 0.0,
+                    "exit_multiple": 1.0,
+                },
+                {
+                    "name": "Slow Grind",
+                    "probability": 0.3,
+                    "future_dilution": 0.5,
+                    "cagr": 0.3,
+                    "exit_multiple": 4.0,
+                },
+                {
+                    "name": "Base",
+                    "probability": 0.3,
+                    "future_dilution": 0.4,
+                    "cagr": 0.8,
+                    "exit_multiple": 8.0,
+                },
+                {
+                    "name": "Bull",
+                    "probability": 0.15,
+                    "future_dilution": 0.35,
+                    "cagr": 1.2,
+                    "exit_multiple": 10.0,
+                },
+                {
+                    "name": "Generational",
+                    "probability": 0.05,
+                    "future_dilution": 0.3,
+                    "cagr": 1.5,
+                    "exit_multiple": 15.0,
+                },
+            ],
+            "benchmarks": [
+                {
+                    "rank_label": "Top 1",
+                    "comparable": "Symbotic",
+                    "exit_valuation_usd": 26_010_000_000.0,
+                    "terminal_arr_usd": 2_520_000_000.0,
+                    "exit_multiple": 10.3,
+                    "multiple_as_of": "2026-07-31",
+                    "multiple_source": "stockanalysis.com",
+                },
+                {
+                    "rank_label": "Top 5",
+                    "comparable": "Berkshire Grey",
+                    "exit_valuation_usd": 375_000_000.0,
+                    "terminal_arr_usd": 66_000_000.0,
+                    "exit_multiple": 5.7,
+                },
+            ],
+            "top_reasons": ["a", "b", "c"],
+            "top_risks": ["x", "y", "z"],
+            "raw_reasoning": "r",
+        }
+    )
+
+
+_COMPLIANT_S7 = (
+    "Comparable multiples (as-of dated)\n\n\n"
+    "| Comparable | Multiple | Basis | As-of date | Source |\n"
+    "|---|---|---|---|---|\n"
+    "| Symbotic | 10.3x | EV/ARR | 2026-07-31 | stockanalysis.com |\n"
+    "| Berkshire Grey | 5.7x | EV/ARR | UNDATED - verify before relying | - |\n"
+)
+
+_COMPLIANT_S8 = (
+    "| Scenario | Probability | Key Assumptions | Gross | Net MoM |\n"
+    "|---|---|---|---|---|\n"
+    "| Zero | 20% | fails | 0x | 0x |\n"
+    "| Slow Grind | 30% | bundled away | 1.2x | 1.0x |\n"
+    "| Base | 30% | durable niche | 4x | 3.2x |\n"
+    "| Bull | 15% | category leader | 8x | 6.1x |\n"
+    "| Generational | 5% | clearinghouse | 15x | 11x |\n"
+)
+
+
+def _memo_md(*, s7: str = _COMPLIANT_S7, s8: str = _COMPLIANT_S8) -> str:
     sections: list[str] = []
     for n in range(1, 10):
         body = "x" * 200
-        if n == 7 and comparables:
-            body += "\n\nComparable multiples (as-of dated)\n| Comp | Multiple | As-of |\n"
+        if n == 7:
+            body += "\n\n" + s7
         if n == 8:
-            body += "\n| Scenario | Gross | Net MoM |\n" if net_mom else "\n| Scenario | Gross |\n"
+            body += "\n\n" + s8
         sections.append(f"## {n}. Section\n{body}")
-    return "# Acme — Investment Memo\n\n" + "\n\n".join(sections)
+    return "# Acme - Investment Memo\n\n" + "\n\n".join(sections)
 
 
-def test_memo_with_mandated_tables_passes() -> None:
-    md = _memo_md(comparables=True, net_mom=True)
-    assert _validate_long_memo(md, has_benchmarks=True, has_scenarios=True) == []
+def test_memo_matching_decision_values_passes() -> None:
+    assert _validate_long_memo(_memo_md(), decision=_arr_decision()) == []
 
 
-def test_memo_missing_comparables_table_fails_when_benchmarks_exist() -> None:
-    problems = _validate_long_memo(_memo_md(comparables=False, net_mom=True), has_benchmarks=True)
+def test_memo_missing_comparables_table_fails() -> None:
+    problems = _validate_long_memo(_memo_md(s7=""), decision=_arr_decision())
     assert any("Comparable multiples" in p for p in problems)
 
 
-def test_memo_missing_comparables_ok_without_benchmarks() -> None:
-    """A pass/custom decision has no benchmarks; the table is not demanded."""
-    assert _validate_long_memo(_memo_md(comparables=False, net_mom=True)) == []
+def test_fabricated_table_under_the_right_heading_fails() -> None:
+    """The residual gap from the adversarial pass: a heading with an empty or
+    invented table must not satisfy the mandate."""
+    fake = (
+        "Comparable multiples (as-of dated)\n\n"
+        "| Comparable | Multiple | Basis | As-of date | Source |\n"
+        "|---|---|---|---|---|\n"
+        "| MadeUpCo | 40x | EV/ARR | 2026-01-01 | vibes |\n"
+    )
+    problems = _validate_long_memo(_memo_md(s7=fake), decision=_arr_decision())
+    assert any("Symbotic" in p for p in problems)
+    assert any("Berkshire Grey" in p for p in problems)
+
+
+def test_wrong_benchmark_multiple_fails() -> None:
+    wrong = _COMPLIANT_S7.replace("10.3x", "40x")
+    problems = _validate_long_memo(_memo_md(s7=wrong), decision=_arr_decision())
+    assert any("Symbotic" in p and "10.3" in p for p in problems)
+
+
+def test_missing_as_of_date_fails_without_undated_marker() -> None:
+    no_marker = _COMPLIANT_S7.replace("UNDATED - verify before relying", "n/a")
+    problems = _validate_long_memo(_memo_md(s7=no_marker), decision=_arr_decision())
+    assert any("UNDATED" in p for p in problems)
+
+
+def test_scenario_absent_or_wrong_probability_fails() -> None:
+    missing_row = _COMPLIANT_S8.replace("| Generational | 5% | clearinghouse | 15x | 11x |\n", "")
+    problems = _validate_long_memo(_memo_md(s8=missing_row), decision=_arr_decision())
+    assert any("Generational" in p for p in problems)
+
+    wrong_prob = _COMPLIANT_S8.replace("| Zero | 20% |", "| Zero | 45% |")
+    problems = _validate_long_memo(_memo_md(s8=wrong_prob), decision=_arr_decision())
+    assert any("Zero" in p and "probability" in p for p in problems)
 
 
 def test_memo_missing_net_mom_column_fails() -> None:
-    problems = _validate_long_memo(
-        _memo_md(comparables=True, net_mom=False), has_benchmarks=True, has_scenarios=True
-    )
+    no_net = _COMPLIANT_S8.replace(" Net MoM |", " Net |").replace("| Net MoM", "| Net")
+    problems = _validate_long_memo(_memo_md(s8=no_net), decision=_arr_decision())
     assert any("Net MoM" in p for p in problems)
+
+
+def test_pass_decision_without_tables_still_validates() -> None:
+    """A pass/custom decision has no benchmarks or scenarios; the memo owes
+    no tables and probability checks must not fire."""
+    assert _validate_long_memo(_memo_md(s7="", s8=""), decision=_decision()) == []
+
+
+def test_decisionless_validation_keeps_structural_checks_only() -> None:
+    assert _validate_long_memo(_memo_md(s7="", s8="")) == []
+    assert _validate_long_memo("too short") != []

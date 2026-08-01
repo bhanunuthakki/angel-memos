@@ -450,11 +450,7 @@ def _generate_long_memo(
                 purpose=Purpose.LONG_MEMO,
                 image_paths=al_pngs + deck_pngs,
             )
-            missing = _validate_long_memo(
-                memo_md,
-                has_benchmarks=bool(decision.benchmarks),
-                has_scenarios=bool(decision.scenarios),
-            )
+            missing = _validate_long_memo(memo_md, decision=decision)
             if not missing:
                 return memo_md
             last_problem = "; ".join(missing)
@@ -470,29 +466,105 @@ _REQUIRED_MEMO_SECTIONS: tuple[str, ...] = tuple(f"## {n}." for n in range(1, 10
 _MIN_MEMO_CHARS = 1500
 
 
-def _validate_long_memo(
-    md: str, *, has_benchmarks: bool = False, has_scenarios: bool = False
-) -> list[str]:
+# The one multiple-like driver each benchmark type carries (SeedBenchmark
+# has none). Probed by name so the validator needs no isinstance ladder.
+_BENCHMARK_MULTIPLE_FIELDS: tuple[str, ...] = (
+    "exit_multiple",
+    "ev_ebitda",
+    "pe_ratio",
+    "revenue_multiple",
+)
+
+
+def _number_variants(value: float) -> tuple[str, ...]:
+    """Renderings a memo may legitimately use for a numeric value: "12",
+    "12.0", "12x" is covered by substring since "12" is. Tolerant of format,
+    intolerant of a different number."""
+    variants = {f"{value:g}"}
+    if value == int(value):
+        variants.add(str(int(value)))
+    else:
+        variants.add(f"{value:.1f}")
+    return tuple(variants)
+
+
+def _probability_variants(probability: float) -> tuple[str, ...]:
+    """Both percent ("25%", "25 %") and decimal ("0.25") renderings."""
+    pct = probability * 100
+    out = {f"{pct:g}%", f"{pct:g} %", f"{probability:g}"}
+    if pct == int(pct):
+        out.add(f"{int(pct)}%")
+    return tuple(out)
+
+
+def _validate_long_memo(md: str, *, decision: Decision | None = None) -> list[str]:
     """Return a list of structural problems with a generated memo (empty when
     it looks like a real 9-section bull/bear memo).
 
     The system prompt's MANDATORY items were previously prose-only — the
     model could (and did) skip the dated-comparables table and the Net-MoM
-    scenario columns with nothing catching it. These checks are deliberately
-    cheap substring/structure tests, not prose assertions: they verify the
-    contracted tables exist, never their wording."""
+    scenario columns with nothing catching it. With a `decision`, the checks
+    go one level deeper than headings: every benchmark comparable and every
+    scenario (name + probability) must actually appear in its section, and
+    each benchmark must carry its multiple and as-of date (or an explicit
+    UNDATED marker) — so a fabricated or empty table under the right heading
+    fails. Values are matched with format tolerance ("25%" or "0.25"), never
+    prose wording."""
     problems: list[str] = []
     if len(md.strip()) < _MIN_MEMO_CHARS:
         problems.append(f"too short ({len(md.strip())} < {_MIN_MEMO_CHARS} chars)")
     missing = [s for s in _REQUIRED_MEMO_SECTIONS if s not in md]
     if missing:
         problems.append("missing sections: " + ", ".join(missing))
-    if has_benchmarks and "Comparable multiples" not in md:
-        problems.append("missing the mandatory 'Comparable multiples (as-of dated)' table")
-    if has_scenarios:
-        section8 = md.partition("## 8.")[2].partition("## 9.")[0]
-        if "Net MoM" not in section8:
+    if decision is None:
+        return problems
+
+    lower_md = md.casefold()
+    if decision.benchmarks:
+        if "Comparable multiples" not in md:
+            problems.append("missing the mandatory 'Comparable multiples (as-of dated)' table")
+        # Scope value checks to §7 so a name in passing prose elsewhere can't
+        # satisfy the table requirement.
+        section7 = lower_md.partition("## 7.")[2].partition("## 8.")[0]
+        for b in decision.benchmarks:
+            if b.comparable.casefold() not in section7:
+                problems.append(f"benchmark comparable '{b.comparable}' absent from section 7")
+                continue
+            multiple = next(
+                (
+                    getattr(b, field)
+                    for field in _BENCHMARK_MULTIPLE_FIELDS
+                    if getattr(b, field, None) is not None
+                ),
+                None,
+            )
+            if multiple is not None and not any(v in section7 for v in _number_variants(multiple)):
+                problems.append(
+                    f"benchmark '{b.comparable}' multiple {multiple:g} absent from section 7"
+                )
+            if b.multiple_as_of:
+                if b.multiple_as_of.casefold() not in section7:
+                    problems.append(
+                        f"benchmark '{b.comparable}' as-of date {b.multiple_as_of} "
+                        "absent from section 7"
+                    )
+            elif "undated" not in section7:
+                problems.append(
+                    f"benchmark '{b.comparable}' has no as-of date and section 7 "
+                    "carries no UNDATED marker"
+                )
+    if decision.scenarios:
+        section8_raw = md.partition("## 8.")[2].partition("## 9.")[0]
+        section8 = section8_raw.casefold()
+        if "Net MoM" not in section8_raw:
             problems.append("scenario table lacks the mandated Net MoM column")
+        for s in decision.scenarios:
+            if s.name.casefold() not in section8:
+                problems.append(f"scenario '{s.name}' absent from section 8")
+            elif not any(v in section8 for v in _probability_variants(s.probability)):
+                problems.append(
+                    f"scenario '{s.name}' probability {s.probability:g} absent from section 8"
+                )
     return problems
 
 
