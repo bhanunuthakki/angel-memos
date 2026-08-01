@@ -380,3 +380,13 @@ def test_gross_mom_cell_cannot_satisfy_probability() -> None:
     )
     problems = _validate_long_memo(_memo_md(s8=s8), decision=_arr_decision())
     assert any("Zero" in p and "probability" in p for p in problems)
+
+
+def test_decorative_pipes_in_prose_are_not_a_table() -> None:
+    """Final adversarial probe: a sentence dressed with two pipes but no
+    |---| separator anywhere in the section must not count as a table row."""
+    s7 = "Note | Symbotic traded at 10.3x as of 2026-07-31 per stockanalysis.com | end"
+    s8 = "Net MoM note | Zero 20%, Slow Grind 30%, Base 30%, Bull 15%, Generational 5% | end"
+    problems = _validate_long_memo(_memo_md(s7=s7, s8=s8), decision=_arr_decision())
+    assert any("Symbotic" in p and "no table row" in p for p in problems)
+    assert any("Zero" in p and "no table row" in p for p in problems)

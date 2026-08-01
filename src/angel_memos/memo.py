@@ -482,8 +482,17 @@ _NUMBER_TOKEN = re.compile(r"\d+(?:\.\d+)?")
 _PERCENT_TOKEN = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 
+_TABLE_SEPARATOR = re.compile(r"\|\s*:?-{3,}")
+
+
 def _table_rows(section: str) -> list[str]:
-    """Markdown table rows in a section: lines with at least two pipes."""
+    """Markdown table rows in a section — but only when the section contains
+    a real table. A `|---` separator line is the signature no decorative
+    pipe-in-prose sentence carries; without one, no line counts as a row
+    (final adversarial-probe finding: "Note | Symbotic at 10.3x | end" must
+    not satisfy the table mandate)."""
+    if not _TABLE_SEPARATOR.search(section):
+        return []
     return [line for line in section.splitlines() if line.count("|") >= 2]
 
 
