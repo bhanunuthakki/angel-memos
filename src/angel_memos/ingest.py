@@ -117,6 +117,10 @@ def ingest_folder(drop: Path, cfg: Config) -> IngestResult:
     DIFFERENT bytes gets a ` (2)` style suffix, while one whose bytes already
     exist in the folder is discarded rather than copied under a second name.
     The consumed drop directory is removed."""
+    # Chrome's Windows download flow can mark the directory read-only. On POSIX,
+    # the equivalent mode also removes directory traversal, so restore the
+    # owner's minimum access before reading and consuming the completed drop.
+    drop.chmod(drop.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
     job = JobRequest.model_validate_json((drop / JOB_FILENAME).read_text(encoding="utf-8"))
     dest = _resolve_dest(cfg.evaluation_root, job.company, drop)
     dest.mkdir(parents=True, exist_ok=True)

@@ -9,11 +9,22 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+
 # Defaults derived from the user's current Drive setup. The Google Doc IDs
 # come from the URLs shared at design time (Public/Private memo docs).
-_DEFAULT_EVALUATION_ROOT = Path(r"G:\My Drive\Personal Finances\Angel Investing\Evaluation")
-_DEFAULT_PORTFOLIO_ROOT = Path(r"G:\My Drive\Personal Finances\Angel Investing\Portfolio")
-_DEFAULT_PASSED_ROOT = Path(r"G:\My Drive\Personal Finances\Angel Investing\Passed")
+def _default_investing_root() -> Path:
+    if os.name == "nt":
+        return Path(r"G:\My Drive\Personal Finances\Angel Investing")
+    cloud_storage = Path.home() / "Library" / "CloudStorage"
+    drive_roots = sorted(cloud_storage.glob("GoogleDrive-*/My Drive"))
+    drive_root = drive_roots[0] if len(drive_roots) == 1 else Path.home() / "Documents"
+    return drive_root / "Personal Finances" / "Angel Investing"
+
+
+_DEFAULT_INVESTING_ROOT = _default_investing_root()
+_DEFAULT_EVALUATION_ROOT = _DEFAULT_INVESTING_ROOT / "Evaluation"
+_DEFAULT_PORTFOLIO_ROOT = _DEFAULT_INVESTING_ROOT / "Portfolio"
+_DEFAULT_PASSED_ROOT = _DEFAULT_INVESTING_ROOT / "Passed"
 _DEFAULT_PUBLIC_DOC_ID = "1nyFj17M4kktlHD028AVF9D-8zeyGRGKC-MXzHNfXA80"
 _DEFAULT_PRIVATE_DOC_ID = "1Ntm55VRReWGTRz4nxm5jK35T_YOlam0Y_0rIxOmYydw"
 
