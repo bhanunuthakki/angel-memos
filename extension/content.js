@@ -23,6 +23,14 @@
 
   const PANEL_ID = "angel-memos-panel";
   const DECK_RE = /\b(pitch\s*deck|deck|presentation)\b/i;
+  const GENERIC_COMPANY_HEADINGS = new Set([
+    "company",
+    "company overview",
+    "deal overview",
+    "investment memo",
+    "memo",
+    "overview",
+  ]);
   const DOC_FETCH_TIMEOUT_MS = 60000; // large decks may expose their signed URL slowly
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -88,7 +96,11 @@
     const company = guessCompanyName();
     const confirmed = window.prompt("Company folder name:", company);
     if (!confirmed) return;
-    const companyName = confirmed.trim();
+    const companyName = cleanupCompanyCandidate(confirmed);
+    if (!companyName || /^company name required$/i.test(companyName)) {
+      setStatus("Enter the company name to capture this deal.");
+      return;
+    }
 
     // Phase 0: arm the router before anything can download.
     setStatus("Arming…");
@@ -134,14 +146,23 @@
       return { gotDeck: false, note: "No deck found…" };
     }
 
-    // If the deck's own row has a download control, use it (router files it).
+    // If the deck's own row exposes a URL, hand that URL to the background.
+    // Never click a page-owned download and rely on the global download
+    // router: Chrome's DownloadItem has no reliable initiating-tab identity,
+    // so a concurrent deal tab could otherwise be filed under this company.
     const row = control.closest ? control.closest("tr") : null;
     const dl =
       row &&
       row.querySelector('button[aria-label="Download" i], a[download], a[href$=".pdf" i]');
-    if (dl) {
-      dl.click();
-      return { gotDeck: true, note: "Downloading deck…" };
+    if (dl && dl.href) {
+      const saved = await send({
+        kind: "am-deck-url",
+        url: new URL(dl.href, location.href).href,
+        name: `${companyName} deck.pdf`,
+      });
+      if (saved.ok) return { gotDeck: true, note: "Downloading deck…" };
+      console.warn("[angel-memos] linked deck download failed:", saved.error);
+      return { gotDeck: false, note: "Deck download failed…" };
     }
 
     // View-only deck: click it open, then watch resource timing for the
@@ -296,9 +317,38 @@
   }
 
   function guessCompanyName() {
-    const h1 = document.querySelector("h1");
-    if (h1 && h1.textContent.trim()) return cleanup(h1.textContent);
-    return cleanup(document.title.split(/[|\-–—]/)[0]);
+    const metadataTitle =
+      document.querySelector('meta[property="og:title"]')?.getAttribute("content") ||
+      document.querySelector('meta[name="twitter:title"]')?.getAttribute("content") ||
+      "";
+    const candidates = [
+      metadataTitle,
+      document.title,
+      document.querySelector("h1")?.textContent || "",
+    ];
+    for (const raw of candidates) {
+      const company = cleanupCompanyCandidate(raw);
+      if (company) return company;
+    }
+    // Keep the prompt editable while making uncertainty explicit. Returning a
+    // generic page heading silently creates the wrong folder and poisons every
+    // later routing decision.
+    return "Company name required";
+  }
+
+  function cleanupCompanyCandidate(text) {
+    const company = cleanup(text)
+      .replace(/\s*[|–—-]\s*AngelList.*$/i, "")
+      .replace(/^investment\s+memo(?:\s+for)?\s*[:–—-]?\s*/i, "")
+      .replace(/^(?:company|deal)?\s*overview\s*(?:[|:–—-]\s*)?/i, "")
+      .trim();
+    if (
+      /^company name required$/i.test(company) ||
+      !/[\p{L}\p{N}]/u.test(company)
+    ) {
+      return "";
+    }
+    return GENERIC_COMPANY_HEADINGS.has(company.toLowerCase()) ? "" : company;
   }
 
   function cleanup(text) {

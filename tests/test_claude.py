@@ -157,6 +157,48 @@ def test_codex_image_args_preserve_stdin_prompt_and_attach_every_image() -> None
     assert "page-2.png" in args
 
 
+def test_codex_paths_follow_agent_instructions_root_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "agent-instructions"
+    wrapper = root / "snippets" / "codex_cli.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("def call_codex_with_usage(): pass\n", encoding="utf-8")
+    executable = root / ".tools" / "node_modules" / ".bin" / "codex"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("", encoding="utf-8")
+    monkeypatch.setenv(claude.AGENT_INSTRUCTIONS_ROOT_ENV_VAR, str(root))
+
+    assert claude._agent_instructions_root() == root
+    assert claude._codex_cli_path(root) == executable
+    assert claude._codex_membership_home(root) == root / ".codex-membership"
+
+
+def test_codex_membership_accepts_success_marker_after_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cli_path = tmp_path / "codex"
+    cli_path.write_text("", encoding="utf-8")
+
+    def fake_run(*_args: object, **_kwargs: object) -> claude.subprocess.CompletedProcess[str]:
+        return claude.subprocess.CompletedProcess(
+            args=[str(cli_path), "login", "status"],
+            returncode=0,
+            stdout="",
+            stderr="WARNING: benign setup notice\nLogged in using ChatGPT\n",
+        )
+
+    monkeypatch.setattr(
+        claude.subprocess,
+        "run",
+        fake_run,
+    )
+
+    claude._verify_codex_membership(cli_path, {})
+
+
 def test_codex_web_required_call_uses_isolated_live_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

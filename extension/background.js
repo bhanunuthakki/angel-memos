@@ -24,7 +24,7 @@ const MAX_RUN_MS = 45000; // hard cap so a stuck download/tab can't hang forever
 const PRINT_TIMEOUT_MS = 15000; // debugger print must not hang the capture
 const POLL_MS = 500; // quiescence poll; also the service-worker keepalive beat
 
-// --- Crash-safety (v0.4.3) ---------------------------------------------------
+// --- Crash-safety (v0.4.3+) -------------------------------------------------
 // job.json is the drop-completeness marker, written LAST. It used to live or
 // die with the service worker's in-memory `active`: an MV3 worker is killed
 // after ~30s idle and setTimeout callbacks do NOT reset that idle timer, so a
@@ -51,9 +51,14 @@ const DECK_URL_HOSTS = /(\.amazonaws\.com|\.cloudfront\.net|\.angellist\.com|\.a
 // In-memory capture state. A capture is a short burst, so keeping this in the
 // (possibly ephemeral) service worker for its duration is fine.
 let active = null;
+// Serialize capture acquisition. Two content-script messages can arrive in
+// the same service-worker turn and both cross an `await restore()` before
+// either has installed `active`; a promise chain makes the check-and-set one
+// atomic operation.
+let armLock = Promise.resolve();
 // active = {
 //   company, dir, tier, sourceUrl, tabId,
-//   startedAt, lastActivity, finalizing,
+//   startedAt, lastActivity, finalizing, jobDownloadId, jobTerminal,
 //   pending:Set<number>, viewerTabs:Set<number>, completed:number
 // }
 
@@ -80,21 +85,23 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     pendingByUrl.delete(item.url);
     if (item.finalUrl) pendingByUrl.delete(item.finalUrl);
     const filename =
-      want || `${ROOT}/${active.dir}/${sanitizeFile(basename(item.filename || ""))}`;
-    suggest({ filename, conflictAction: "uniquify" });
+      (want && want.filename) ||
+      `${ROOT}/${active.dir}/${sanitizeFile(basename(item.filename || ""))}`;
+    suggest({
+      filename,
+      conflictAction: (want && want.conflictAction) || "uniquify",
+    });
     return;
   }
-  if (!isAngelListItem(item)) {
-    suggest();
-    return;
-  }
-  // Page-initiated download during a capture (e.g. a deck row's own button).
-  const base = sanitizeFile(basename(item.filename || item.url));
-  suggest({ filename: `${ROOT}/${active.dir}/${base}`, conflictAction: "uniquify" });
+  // Never sweep page-initiated downloads into the active company. Download
+  // items do not expose a trustworthy initiating tab id, so another deal tab
+  // could otherwise contaminate this capture. content.js hands every accepted
+  // deck URL to us explicitly through am-deck-url.
+  suggest();
 });
 
 chrome.downloads.onCreated.addListener((item) => {
-  if (!active) return;
+  if (!active || item.byExtensionId !== chrome.runtime.id) return;
   active.pending.add(item.id);
   active.seen.add(item.id);
   active.lastActivity = Date.now();
@@ -105,7 +112,13 @@ chrome.downloads.onChanged.addListener((delta) => {
   if (!active || !delta.state) return;
   const state = delta.state.current;
   if (state === "complete" || state === "interrupted") {
-    if (active.pending.delete(delta.id) && state === "complete") active.completed += 1;
+    if (
+      active.pending.delete(delta.id) &&
+      state === "complete" &&
+      delta.id !== active.jobDownloadId
+    ) {
+      active.completed += 1;
+    }
     active.lastActivity = Date.now();
     persist();
   }
@@ -156,10 +169,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Every phase after am-arm runs in a worker that may have been restarted
   // since, so rehydrate `active` before dispatching rather than failing with
   // "capture not armed" and stranding the drop.
-  const respond = (run) => {
+  const respond = (run, restoreState = true) => {
     Promise.resolve()
       .then(async () => {
-        if (!active && msg.kind !== "am-arm") active = await restore();
+        if (restoreState && !active) active = await restore();
         return run();
       })
       .then((value) => sendResponse(Object.assign({ ok: true }, value || {})))
@@ -168,25 +181,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   };
   switch (msg.kind) {
     case "am-arm":
-      return respond(() => arm(msg, sender.tab));
+      return respond(
+        () =>
+          withArmLock(async () => {
+            if (!active) active = await restore();
+            return arm(msg, sender.tab);
+          }),
+        false
+      );
     case "am-print-page":
       return respond(() => printMemo(sender.tab));
     case "am-deck-url":
-      return respond(() => downloadDeckUrl(msg));
+      return respond(() => downloadDeckUrl(msg, sender.tab));
     case "am-finalize":
-      return respond(() => finalize());
+      return respond(() => finalize(sender.tab));
     case "am-run": // stale content script (pre-0.4) — print + finalize
       console.warn("[angel-memos] legacy am-run — reload the AngelList tab");
-      return respond(() => printMemo(sender.tab).then(() => finalize()));
+      return respond(() => printMemo(sender.tab).then(() => finalize(sender.tab)));
     default:
       return false;
   }
 });
 
+function withArmLock(run) {
+  const result = armLock.then(run, run);
+  armLock = result.catch(() => {});
+  return result;
+}
+
 async function arm(msg, tab) {
   const company = (msg.company || "").trim();
   const dir = sanitizeFolder(company);
-  if (!dir) throw new Error("empty company name");
+  if (!dir || !hasCompanyNameCharacter(dir)) {
+    throw new Error("enter a valid company name containing a letter or number");
+  }
+  if (active) {
+    throw new Error(
+      `capture already running for "${active.company}"; wait for it to finish before starting another deal`
+    );
+  }
   const now = Date.now();
   pendingByUrl.clear();
   pendingNameQueue.length = 0;
@@ -204,6 +237,8 @@ async function arm(msg, tab) {
     completed: 0,
     deckCaptured: false,
     finalizing: false,
+    jobDownloadId: null,
+    jobTerminal: false,
   };
   await persist();
   // Arm the backstop before anything can fail: from here on, this capture
@@ -231,6 +266,8 @@ function persist() {
     completed: active.completed,
     deckCaptured: active.deckCaptured,
     finalizing: active.finalizing,
+    jobDownloadId: active.jobDownloadId,
+    jobTerminal: active.jobTerminal,
   };
   return chrome.storage.session
     .set({ [STATE_KEY]: snapshot })
@@ -254,6 +291,8 @@ async function restore() {
     pending: new Set(raw.pending || []),
     seen: new Set(raw.seen || []),
     viewerTabs: new Set(raw.viewerTabs || []),
+    jobDownloadId: Number.isInteger(raw.jobDownloadId) ? raw.jobDownloadId : null,
+    jobTerminal: Boolean(raw.jobTerminal),
   });
 }
 
@@ -268,25 +307,38 @@ async function clearPersisted() {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== GUARD_ALARM) return;
   if (!active) active = await restore();
-  if (!active || active.finalizing) {
+  if (!active) {
+    await clearPersisted();
+    return;
+  }
+  // A terminal marker means only cleanup was interrupted. A merely scheduled
+  // marker is not enough: reconcile its download id and retry on interruption.
+  if (active.jobTerminal) {
+    active = null;
     await clearPersisted();
     return;
   }
   console.warn(`[angel-memos] guard fired — finalizing abandoned "${active.company}"`);
   // Downloads have long since settled by now; don't re-wait for quiescence.
+  active.finalizing = false;
   active.pending.clear();
   active.viewerTabs.clear();
   try {
-    await finalize();
+    await finalize(null, true);
   } catch (err) {
     console.warn("[angel-memos] guard finalize failed:", err);
-    await clearPersisted();
+    if (active) {
+      active.finalizing = false;
+      await persist();
+      await chrome.alarms.create(GUARD_ALARM, {
+        delayInMinutes: GUARD_DELAY_MINUTES,
+      });
+    }
   }
 });
 
 async function printMemo(tab) {
-  if (!active) throw new Error("capture not armed");
-  if (!tab || tab.id == null) throw new Error("no sender tab");
+  assertCaptureOwner(tab);
   const b64 = await withTimeout(printPageToPdf(tab.id), PRINT_TIMEOUT_MS, "page print");
   // Sanitize the leaf name: a raw company name with an illegal char (":", "?",
   // etc.) makes chrome.downloads silently reject the memo, so the drop lands
@@ -299,8 +351,8 @@ async function printMemo(tab) {
   console.log(`[angel-memos] memo printed for "${active.company}"`);
 }
 
-async function downloadDeckUrl(msg) {
-  if (!active) throw new Error("capture not armed");
+async function downloadDeckUrl(msg, tab) {
+  assertCaptureOwner(tab);
   const url = String(msg.url || "");
   let host;
   try {
@@ -318,15 +370,20 @@ async function downloadDeckUrl(msg) {
   console.log(`[angel-memos] deck download started: ${name}`);
 }
 
-async function finalize() {
+async function finalize(tab = null, skipWait = false) {
   if (!active) throw new Error("capture not armed");
-  // The guard alarm and an am-finalize message can both land; job.json must
-  // be written exactly once.
-  if (active.finalizing) return { count: active.completed };
+  // Alarm-driven crash recovery has no sender tab. Every page-driven phase
+  // must come from the tab that armed the capture, so a stale tab cannot
+  // download or finalize files under another company's folder.
+  if (tab) assertCaptureOwner(tab);
+  // The guard alarm and an am-finalize message can both land. A terminal
+  // marker is complete; an in-flight marker is reconciled by the one caller
+  // that owns `finalizing`.
+  if (active.jobTerminal || active.finalizing) return { count: active.completed };
   active.finalizing = true;
   active.lastActivity = Date.now();
   await persist();
-  await waitForQuiescence();
+  if (!skipWait) await waitForQuiescence();
 
   const job = {
     // Write the sanitized folder name so job.company and the drop/Evaluation
@@ -340,16 +397,72 @@ async function finalize() {
     pending_at_finalize: active.pending.size,
   };
   const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(job, null, 2))));
-  await startDownload({
-    url: "data:application/json;base64," + encoded,
-    filename: `${ROOT}/${active.dir}/job.json`,
-  });
+  await ensureJobMarker("data:application/json;base64," + encoded);
+  active.jobTerminal = true;
+  await persist();
 
   const count = active.completed;
   console.log(`[angel-memos] done "${active.company}": ${count} file(s) saved`);
   active = null;
   await clearPersisted();
   return { count };
+}
+
+async function ensureJobMarker(url) {
+  if (!active) throw new Error("capture not armed");
+  if (active.jobDownloadId != null) {
+    const existing = await waitForDownload(active.jobDownloadId, MAX_RUN_MS);
+    if (existing === "complete") return;
+    active.jobDownloadId = null;
+    await persist();
+  }
+
+  // `overwrite` is deliberate. If the worker dies after Chrome accepts this
+  // download but before its id is persisted, recovery may schedule it again;
+  // a deterministic filename keeps that crash window idempotent instead of
+  // producing job (1).json.
+  const id = await startDownload({
+    url,
+    filename: `${ROOT}/${active.dir}/job.json`,
+    conflictAction: "overwrite",
+  });
+  active.jobDownloadId = id;
+  await persist();
+
+  const terminal = await waitForDownload(id, MAX_RUN_MS);
+  if (terminal !== "complete") {
+    active.jobDownloadId = null;
+    active.finalizing = false;
+    await persist();
+    throw new Error(`job.json download ${terminal || "did not complete"}`);
+  }
+}
+
+async function waitForDownload(id, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    let item;
+    try {
+      item = (await chrome.downloads.search({ id }))[0];
+    } catch {
+      item = null;
+    }
+    if (item && (item.state === "complete" || item.state === "interrupted")) {
+      return item.state;
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+  }
+  return "timed out";
+}
+
+function assertCaptureOwner(tab) {
+  if (!active) throw new Error("capture not armed");
+  if (!tab || tab.id == null) throw new Error("no sender tab");
+  if (tab.id !== active.tabId) {
+    throw new Error(
+      `capture already running for "${active.company}" in another tab; wait for it to finish`
+    );
+  }
 }
 
 // Resolve once no download/tab activity for QUIET_MS with nothing pending and
@@ -398,7 +511,12 @@ async function reconcilePending() {
     // A vanished record can never produce a completion event; treat it as
     // settled rather than waiting on it forever.
     if (!item || item.state === "complete" || item.state === "interrupted") {
-      if (active.pending.delete(id) && item && item.state === "complete") {
+      if (
+        active.pending.delete(id) &&
+        item &&
+        item.state === "complete" &&
+        id !== active.jobDownloadId
+      ) {
         active.completed += 1;
       }
     }
@@ -423,8 +541,12 @@ function startDownload(options) {
   // Record the intended path BEFORE starting, so the router can re-suggest it
   // (see header note about onDeterminingFilename overriding download paths).
   if (options.filename) {
-    pendingByUrl.set(options.url, options.filename);
-    pendingNameQueue.push(options.filename);
+    const intended = {
+      filename: options.filename,
+      conflictAction: options.conflictAction || "uniquify",
+    };
+    pendingByUrl.set(options.url, intended);
+    pendingNameQueue.push(intended);
   }
   return chrome.downloads.download(
     Object.assign({ conflictAction: "uniquify", saveAs: false }, options)
@@ -451,11 +573,6 @@ function withTimeout(promise, ms, label) {
 
 // --- Helpers. ----------------------------------------------------------------
 
-function isAngelListItem(item) {
-  const hay = `${item.url || ""} ${item.finalUrl || ""} ${item.referrer || ""}`;
-  return /angellist\.com|amazonaws\.com/i.test(hay);
-}
-
 function deckFilename(title) {
   const base = sanitizeFile((title || "deck").replace(/\s*\|\s*angellist.*$/i, ""));
   return /\.pdf$/i.test(base) ? base : `${base}.pdf`;
@@ -468,6 +585,10 @@ function sanitizeFolder(name) {
     .trim()
     .replace(/\.+$/, "")
     .slice(0, 80);
+}
+
+function hasCompanyNameCharacter(name) {
+  return /[\p{L}\p{N}]/u.test(name || "");
 }
 
 function sanitizeFile(name) {

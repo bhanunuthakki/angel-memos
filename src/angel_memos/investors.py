@@ -17,17 +17,19 @@ appeared in (a proxy for how often you co-invest alongside them).
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
 from collections.abc import Callable
-from datetime import date
+from datetime import date, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from angel_memos.claude import LlmCallError
 from angel_memos.config import Config
 from angel_memos.models import AngelListMetadata
 
@@ -35,6 +37,8 @@ DATA_DIR_ENV_VAR = "ANGEL_MEMOS_DATA_DIR"
 DB_FILENAME = "investors.db"
 EXPORT_FILENAME = "investors.md"
 STALE_AFTER_DAYS = 180
+
+logger = logging.getLogger(__name__)
 
 _AL_CACHE_FILENAME = ".angellist_cache.json"
 
@@ -202,6 +206,28 @@ def grade_investor(name: str, context: str) -> InvestorResearch:
     )
 
 
+def _unverified_research(name: str) -> InvestorResearch:
+    """Explicit degraded result when governed web research is unavailable.
+
+    Grade D already owns unknown/unverifiable evidence in the persisted rubric.
+    The deliberately stale timestamp applied by ``lookup_or_grade`` makes the
+    next deal retry the research instead of trusting this operational fallback
+    for the normal 180-day freshness window.
+    """
+    return InvestorResearch(
+        name=name.strip(),
+        investor_type="unknown",
+        grade=InvestorGrade.D,
+        grade_justification=(
+            "Automated web research was unavailable; assigned Grade D per the "
+            "unknown/unverifiable rubric rather than guessing."
+        ),
+        notable_investments=[],
+        track_record_summary="Unverified; no attributable track record was established.",
+        sources=["Automated web research unavailable; retry required."],
+    )
+
+
 def lookup_or_grade(
     conn: sqlite3.Connection,
     names: list[str],
@@ -225,23 +251,43 @@ def lookup_or_grade(
         existing = get_record(conn, name)
         if existing is not None:
             is_stale = (resolved_today - existing.last_refreshed).days > STALE_AFTER_DAYS
-            research = research_fn(name, context) if is_stale else existing.research
+            research = existing.research
+            last_refreshed = existing.last_refreshed
+            if is_stale:
+                try:
+                    research = research_fn(name, context)
+                    last_refreshed = resolved_today
+                except LlmCallError:
+                    logger.warning(
+                        "investor research unavailable for %s; retaining stale grade",
+                        name,
+                    )
             record = InvestorRecord(
                 key=key,
                 display_name=existing.display_name,
                 research=research,
                 deals_seen=existing.deals_seen + 1,
                 first_seen=existing.first_seen,
-                last_refreshed=resolved_today if is_stale else existing.last_refreshed,
+                last_refreshed=last_refreshed,
             )
         else:
+            last_refreshed = resolved_today
+            try:
+                research = research_fn(name, context)
+            except LlmCallError:
+                logger.warning(
+                    "investor research unavailable for %s; recording retryable Grade D",
+                    name,
+                )
+                research = _unverified_research(name)
+                last_refreshed = resolved_today - timedelta(days=STALE_AFTER_DAYS + 1)
             record = InvestorRecord(
                 key=key,
                 display_name=name.strip(),
-                research=research_fn(name, context),
+                research=research,
                 deals_seen=1,
                 first_seen=resolved_today,
-                last_refreshed=resolved_today,
+                last_refreshed=last_refreshed,
             )
         upsert_record(conn, record)
         records.append(record)

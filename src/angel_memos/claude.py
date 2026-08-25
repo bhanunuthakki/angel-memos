@@ -33,6 +33,7 @@ from angel_memos.claude_cli import extract_structured as extract_claude_structur
 DEFAULT_TIMEOUT_SECONDS = 600
 _CODEX_RETRY_DELAY_SECONDS = 5
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+AGENT_INSTRUCTIONS_ROOT_ENV_VAR = "ANGEL_MEMOS_AGENT_INSTRUCTIONS_ROOT"
 
 
 class Purpose(StrEnum):
@@ -727,7 +728,7 @@ def _load_codex_module() -> _CodexModule:
     module_name = "_angel_memos_codex_cli"
     existing = sys.modules.get(module_name)
     if existing is None:
-        path = Path.home() / ".gemini" / "snippets" / "codex_cli.py"
+        path = _agent_instructions_root() / "snippets" / "codex_cli.py"
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:
             raise RuntimeError("could not load the canonical Codex membership wrapper")
@@ -751,8 +752,9 @@ def _call_codex_direct(
     for image_path in image_paths:
         if not image_path.is_file():
             raise FileNotFoundError(f"Codex image attachment not found: {image_path}")
-    cli_path = Path.home() / ".gemini" / ".tools" / "node_modules" / ".bin" / "codex.cmd"
-    codex_home = Path.home() / ".gemini" / ".codex-membership"
+    instructions_root = _agent_instructions_root()
+    cli_path = _codex_cli_path(instructions_root)
+    codex_home = _codex_membership_home(instructions_root)
     env = _codex_membership_env(codex_home)
     _verify_codex_membership(cli_path, env)
     with tempfile.TemporaryDirectory(prefix="codex-llm-") as temp_dir:
@@ -786,6 +788,38 @@ def _call_codex_direct(
     return _parse_codex_events(completed.stdout)
 
 
+def _agent_instructions_root() -> Path:
+    override = os.environ.get(AGENT_INSTRUCTIONS_ROOT_ENV_VAR, "").strip()
+    if override:
+        return Path(override)
+
+    candidates = (
+        Path.home() / ".gemini",
+        Path("/Applications/agent-instructions"),
+    )
+    for candidate in candidates:
+        if (candidate / "snippets" / "codex_cli.py").is_file():
+            return candidate
+    raise FileNotFoundError(
+        "agent-instructions root not found; set " + AGENT_INSTRUCTIONS_ROOT_ENV_VAR
+    )
+
+
+def _codex_cli_path(instructions_root: Path) -> Path:
+    bin_dir = instructions_root / ".tools" / "node_modules" / ".bin"
+    for name in ("codex.cmd", "codex"):
+        candidate = bin_dir / name
+        if candidate.is_file():
+            return candidate
+    # Return the platform-native expected path so the existing setup check
+    # emits the stable "not installed" error without guessing another home.
+    return bin_dir / ("codex.cmd" if os.name == "nt" else "codex")
+
+
+def _codex_membership_home(instructions_root: Path) -> Path:
+    return instructions_root / ".codex-membership"
+
+
 def _codex_membership_env(codex_home: Path) -> dict[str, str]:
     env = dict(os.environ)
     env.pop("OPENAI_API_KEY", None)
@@ -811,8 +845,8 @@ def _verify_codex_membership(cli_path: Path, env: dict[str, str]) -> None:
         )
     except (OSError, subprocess.TimeoutExpired):
         raise RuntimeError("Codex membership authentication could not be verified") from None
-    values = (status.stdout.strip(), status.stderr.strip())
-    if status.returncode != 0 or "Logged in using ChatGPT" not in values:
+    output = f"{status.stdout}\n{status.stderr}"
+    if status.returncode != 0 or "Logged in using ChatGPT" not in output:
         raise RuntimeError("dedicated Codex home is not signed in with ChatGPT")
 
 

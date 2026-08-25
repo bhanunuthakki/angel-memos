@@ -6,7 +6,11 @@ configuration values that materially affect capture reliability.
 
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 _CONTENT_SCRIPT = Path(__file__).parents[1] / "extension" / "content.js"
 _BACKGROUND = Path(__file__).parents[1] / "extension" / "background.js"
@@ -24,7 +28,19 @@ def test_deck_fetch_waits_up_to_sixty_seconds() -> None:
 def test_timeout_fix_bumps_extension_patch_version() -> None:
     manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
 
-    assert manifest["version"] == "0.4.3"
+    assert manifest["version"] == "0.4.6"
+
+
+def test_company_name_prefers_page_metadata_over_generic_heading() -> None:
+    """AngelList deal pages commonly use a generic H1 such as "Overview";
+    the document metadata/title carries the actual company name."""
+    source = _CONTENT_SCRIPT.read_text(encoding="utf-8")
+    function = source[source.index("function guessCompanyName()") :]
+
+    assert function.index("document.title") < function.index('document.querySelector("h1")')
+    assert "GENERIC_COMPANY_HEADINGS" in source
+    assert '"overview"' in source
+    assert '"investment memo"' in source
 
 
 # ---------------------------------------------------------------------------
@@ -93,3 +109,45 @@ def test_finalize_is_idempotent() -> None:
     source = _BACKGROUND.read_text(encoding="utf-8")
 
     assert "active.finalizing" in source
+    assert "active.jobDownloadId" in source
+    assert "active.jobTerminal" in source
+
+
+def test_guard_restarts_a_finalization_interrupted_by_worker_shutdown() -> None:
+    """A persisted ``finalizing`` flag means no work is still running after
+    service-worker restoration; the alarm must resume rather than discard it."""
+    source = _BACKGROUND.read_text(encoding="utf-8")
+    alarm_handler = source[
+        source.index("chrome.alarms.onAlarm.addListener") : source.index("async function printMemo")
+    ]
+
+    assert "active.jobTerminal" in alarm_handler
+    assert "active.finalizing = false" in alarm_handler
+    assert alarm_handler.index("active.finalizing = false") < alarm_handler.index(
+        "await finalize(null, true)"
+    )
+
+
+def test_concurrent_capture_cannot_replace_the_active_company() -> None:
+    """A second deal tab must not overwrite the single active router state;
+    that mixes decks across companies and strands both drops without job.json."""
+    source = _BACKGROUND.read_text(encoding="utf-8")
+
+    assert "capture already running" in source
+    assert "assertCaptureOwner" in source
+    assert "if (!active) active = await restore();" in source
+
+
+def test_capture_event_ordering_and_recovery_runtime() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for extension runtime tests")
+
+    result = subprocess.run(
+        [node, "--test", str(Path(__file__).with_name("extension_capture_runtime.test.js"))],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

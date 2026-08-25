@@ -15,6 +15,11 @@ Capture writes the **AL memo and, when the deal provides one, the deck** into
 finalization or ingestion. Everything else in the dataroom (closing documents,
 disclaimers, etc.) is deliberately ignored.
 
+Captures are deliberately single-flight. Wait for the panel to show the saved
+checkmark before starting another deal in a different tab. If a capture is
+already running, the second tab shows which company must finish first; it never
+reassigns the first capture's downloads to the second company's folder.
+
 1. **AL memo** — the deal page printed to PDF (`angellist - <Company>.pdf`)
    via Chrome's debugger API, with the panel hidden and *before* the deck
    viewer opens, so neither appears in the print.
@@ -31,6 +36,11 @@ disclaimers, etc.) is deliberately ignored.
      real new tab is printed from that tab as a fallback.
 3. `job.json` is written **last** — the watcher treats it as the "drop is
    complete" marker, so it lands only after the memo + deck settle.
+
+The company-folder prompt prefers AngelList's page metadata/title and ignores
+generic headings such as `Overview` or `Investment Memo`. Confirm the proposed
+name before starting the capture. Placeholder values made only of punctuation,
+such as `----`, are rejected.
 
 The junk-document rows (the ones that *do* have download buttons) are never
 clicked, so closing docs and disclaimers don't come through.

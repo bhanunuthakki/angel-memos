@@ -5,6 +5,7 @@ web-research grading call is injected as a plain callable."""
 from datetime import date
 from pathlib import Path
 
+from angel_memos.claude import LlmCallError
 from angel_memos.config import Config
 from angel_memos.investors import (
     STALE_AFTER_DAYS,
@@ -209,6 +210,49 @@ def test_lookup_dedups_names_within_one_call(tmp_path: Path) -> None:
     assert len(calls) == 1
     assert len(records) == 1
     assert records[0].deals_seen == 1
+
+
+def test_lookup_records_unverified_unknown_when_research_transport_fails(
+    tmp_path: Path,
+) -> None:
+    conn = connect(tmp_path / "investors.db")
+    today = date(2026, 7, 11)
+
+    def failed_research(name: str, context: str) -> InvestorResearch:
+        raise LlmCallError("all configured transports failed")
+
+    records = lookup_or_grade(
+        conn,
+        ["K8"],
+        research_fn=failed_research,
+        today=today,
+    )
+
+    assert len(records) == 1
+    assert records[0].research.grade is InvestorGrade.D
+    assert records[0].research.investor_type == "unknown"
+    assert "unavailable" in records[0].research.grade_justification.lower()
+    assert (today - records[0].last_refreshed).days > STALE_AFTER_DAYS
+    assert get_record(conn, "K8") == records[0]
+
+
+def test_lookup_keeps_stale_grade_when_refresh_transport_fails(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "investors.db")
+    stale = _record(grade=InvestorGrade.B, last_refreshed=date(2025, 1, 1))
+    upsert_record(conn, stale)
+
+    def failed_research(name: str, context: str) -> InvestorResearch:
+        raise LlmCallError("all configured transports failed")
+
+    records = lookup_or_grade(
+        conn,
+        ["Lux Capital"],
+        research_fn=failed_research,
+        today=date(2026, 7, 11),
+    )
+
+    assert records[0].research.grade is InvestorGrade.B
+    assert records[0].last_refreshed == stale.last_refreshed
 
 
 # ---------------------------------------------------------------------------
