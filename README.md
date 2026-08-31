@@ -24,10 +24,28 @@ diligence, financial modeling, and an adversarial bear case.
 - **Chrome Extension (`extension/`)**: Manifest V3 extension for deal capture on AngelList.
 - **Diligence & LLM Synthesis**: Schema-governed LLM workflows that pressure-test investment
   theses and generate adversarial counter-arguments.
-- **Templates (`templates/`)**: Stage-appropriate exit math sheets across valuation methods.
+
+## Quick start
+
+Requires Python 3.13 or later.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+angel-memos --help
+```
+
+This is a local, single-user research tool. It is not a hosted service, and the
+repository does not include private deal-room files or spreadsheet templates.
 
 ## Privacy & Anonymization
 
-This repository contains only the engine, extension, scoring rubrics, and templates.
+This repository contains only the engine, extension, and scoring rubrics.
 All confidential deal room PDFs, founder materials, and investor databases remain strictly
 local and are ignored by git.
+
+Automated masking is not a guarantee of anonymity. A human must review every
+generated public memo before sharing it. Confidential source files must never
+enter Git, even temporarily. The checked-in financial examples are synthetic,
+not investment advice, and do not describe a real deal.

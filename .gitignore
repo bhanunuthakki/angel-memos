@@ -20,3 +20,15 @@ credentials.json
 # Sensitive/personal fixtures — drop your own copies locally; never commit.
 tests/fixtures/*.pdf
 tests/fixtures/*.xlsx
+
+# Local deal-room and generated artifacts.
+Evaluation/
+Portfolio/
+**/memo_private.md
+**/memo_public.md
+**/decision.md
+**/score_report.json
+**/research_memo.md
+investors.md
+*.pdf
+*.xlsx

@@ -57,15 +57,13 @@ Cross-deal state (outside the folder contract): `~/.angel-memos/investors.db` (s
 
 ## Agent and application model routing
 
-Interactive research follows
-`C:\Users\Bhanu\.gemini\procedures\agent-operations.md`. The
+Interactive research follows the runtime's `agent-operations` procedure. The
 repo-specific constraint is:
 the root session has sole ownership of company-folder writes — workers never
 touch `decision.md`, memo files, or other company-folder outputs.
 
 Application LLM calls remain separate from interactive agent routing. They use
-the membership transport contract in
-`C:\Users\Bhanu\.gemini\procedures\llm-ops.TRANSPORTS.md` and
+the runtime's membership transport contract and
 enter once through `src/angel_memos/claude.py`; downstream code never imports
 `anthropic` or `claude_agent_sdk`. Select exact application models by named
 purpose behind that entry point and change a stability pin only with an eval
@@ -86,7 +84,7 @@ file.
 
 ## Testing
 
-- Use `C:\Users\Bhanu\.gemini\procedures\code-change.md`. Schemas have their tests; orchestration tests mock the Claude call.
+- Use the runtime's `code-change` procedure. Schemas have their tests; orchestration tests mock the Claude call.
 - Golden fixtures live in `tests/fixtures/`:
   - `SpotAI_AL_Details.pdf` — AngelList parser fixture
   - `SpotAI_Exit_Math.xlsx` — `arr_multiple` template golden output
