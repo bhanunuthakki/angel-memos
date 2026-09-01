@@ -5,6 +5,14 @@ if git grep -I -l -E '(/Users/|/home/|[A-Za-z]:\\Users\\)' -- ':!scripts/check_p
   echo "Personal absolute path found in tracked content" >&2
   exit 1
 fi
+if git grep -I -l -E '(-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}|(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password)[[:space:]]*[=:][[:space:]]*[A-Za-z0-9_./+=-]{16,})' -- ':!scripts/check_public_tree.sh' ':!scripts/test_public_tree_guard.sh'; then
+  echo "Credential material found in tracked content" >&2
+  exit 1
+fi
+if git grep -I -l -i -E '(my|owner|personal|brokerage|portfolio|holding|account).{0,80}(cost[ _-]*basis|account[ _-]*balance|position[ _-]*(value|size)|share[ _-]*quantity|shares|account[ _-]*(id|number)).{0,40}[$]?[0-9]' -- '*.md' '*.json' '*.csv' '*.tsv' '*.yaml' '*.yml' '*.txt' ':!scripts/check_public_tree.sh' ':!scripts/test_public_tree_guard.sh'; then
+  echo "Personal account-level fact found in tracked content" >&2
+  exit 1
+fi
 if git ls-files | grep -E '(^|/)(credentials\.json|token\.json|.*\.db|.*\.sqlite|.*\.pem|.*\.key)$'; then
   echo "Credential or local-data artifact is tracked" >&2
   exit 1

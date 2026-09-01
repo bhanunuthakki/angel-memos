@@ -14,4 +14,5 @@ jobs:
           enable-cache: true
       - run: uv sync --extra dev
       - run: bash scripts/check_public_tree.sh
+      - run: bash scripts/test_public_tree_guard.sh
       - run: uv run pytest -q
