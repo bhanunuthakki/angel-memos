@@ -175,6 +175,24 @@ def test_codex_paths_follow_agent_instructions_root_override(
     assert claude._codex_membership_home(root) == root / ".codex-membership"
 
 
+def test_agent_instructions_root_finds_sibling_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    applications = tmp_path / "Applications"
+    module_path = applications / "angel-memos" / "src" / "angel_memos" / "claude.py"
+    root = applications / "agent-instructions"
+    wrapper = root / "snippets" / "codex_cli.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("def call_codex_with_usage(): pass\n", encoding="utf-8")
+    monkeypatch.delenv(claude.AGENT_INSTRUCTIONS_ROOT_ENV_VAR, raising=False)
+    monkeypatch.setenv("AGENT_INSTRUCTIONS_DIR", str(tmp_path / "missing"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(claude, "__file__", str(module_path))
+
+    assert claude._agent_instructions_root() == root
+
+
 def test_codex_membership_accepts_success_marker_after_warning(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -796,6 +796,7 @@ def _agent_instructions_root() -> Path:
     candidates = (
         Path.home() / ".gemini",
         Path(os.environ.get("AGENT_INSTRUCTIONS_DIR", "agent-instructions")),
+        Path(__file__).resolve().parents[3] / "agent-instructions",
     )
     for candidate in candidates:
         if (candidate / "snippets" / "codex_cli.py").is_file():
