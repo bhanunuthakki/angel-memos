@@ -184,6 +184,8 @@ def all_variants_for(amount: float) -> Iterable[str]:
 REVIEW_MARKER = "[NEEDS BHANU REVIEW"
 
 _DOMAIN_TLDS: tuple[str, ...] = (".com", ".io", ".ai", ".co", ".xyz", ".app", ".dev", ".net")
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://[^\s)<>]+|\b(?:www\.)[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 
 # Generic trailing words that make a company name (e.g. "Quaise Energy") — if
 # the last token is one of these, the bare stem ("Quaise") is also identifying.
@@ -212,6 +214,8 @@ def find_public_leaks(
     founders: list[str] | None = None,
     check_usd: float | None = None,
     post_money_usd: float | None = None,
+    private_values: Iterable[float] = (),
+    private_only_terms: Iterable[str] = (),
 ) -> list[str]:
     """Return the list of deal-identifying strings found in `text` (empty if
     clean). Case-insensitive; catches concatenated/hyphenated/domain company
@@ -232,11 +236,24 @@ def find_public_leaks(
             if _word_present(text, part):
                 leaks.append(f"founder:{part}")
 
-    for amount, label in ((check_usd, "check"), (post_money_usd, "post_money")):
+    amounts = [
+        (check_usd, "check"),
+        (post_money_usd, "post_money"),
+        *[(v, "private") for v in private_values],
+    ]
+    for amount, label in amounts:
         if amount is not None:
             for variant in _usd_variants(amount):
                 if variant in text:
                     leaks.append(f"{label}:{variant}")
+
+    for term in private_only_terms:
+        if term and _word_present(text, term):
+            leaks.append(f"private-term:{term}")
+    for match in _EMAIL_RE.finditer(text):
+        leaks.append(f"email:{match.group(0)}")
+    for match in _URL_RE.finditer(text):
+        leaks.append(f"url:{match.group(0)}")
 
     if REVIEW_MARKER in text:
         leaks.append("review-marker")

@@ -156,6 +156,8 @@ class PublicDocEntry(BaseModel):
     competitive_moat: CompetitiveMoatSection | None = None
     anti_thesis_paragraphs: list[str] = Field(min_length=2, max_length=4)
     bull_case: BullCaseSection
+    private_only_terms: list[str] = Field(default_factory=list, max_length=80)
+    approval_sha256: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 def public_entry_heading(entry: PublicDocEntry) -> str:
@@ -485,6 +487,9 @@ def build_public_entry_prompt(
             "labels. Bull Case ends with `Verdict: GO. <one sentence on entry-"
             "price defensibility>`. Where you make an inference Bhanu didn't "
             "surface, prefix it `[NEEDS BHANU REVIEW: <inference>]`.",
+            "The `private_only_terms` field must list every customer, entity alias, "
+            "URL/domain, email, or distinctive private phrase that must not reach "
+            "the public document. Keep it empty only when none exist.",
         ]
     )
     return "\n".join(lines)

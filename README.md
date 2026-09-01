@@ -36,6 +36,12 @@ pip install -e '.[dev]'
 angel-memos --help
 ```
 
+Enable the local public-boundary check before pushing:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 This is a local, single-user research tool. It is not a hosted service, and the
 repository does not include private deal-room files or spreadsheet templates.
 
