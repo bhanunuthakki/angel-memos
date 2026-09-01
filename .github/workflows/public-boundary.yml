@@ -1,0 +1,17 @@
+name: Public Boundary
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  public-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev
+      - run: bash scripts/check_public_tree.sh
+      - run: uv run pytest -q
