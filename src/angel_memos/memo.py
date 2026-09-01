@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import tempfile
 from datetime import date
@@ -68,6 +69,7 @@ _PUBLIC_ENTRY_FILENAME = "public_entry.json"
 # `publish` can refuse to push entries that no longer match a since-edited
 # decision (a buy->pass flip would otherwise publish contradictory content).
 _ENTRY_META_FILENAME = ".entry_meta.json"
+_PUBLIC_APPROVAL_FILENAME = ".public_approval.json"
 
 
 class StaleEntryError(RuntimeError):
@@ -284,10 +286,9 @@ def publish_decision_to_docs(folder: Path, config: Config, *, force: bool = Fals
     `public_entry.json` from disk and inserts under the appropriate
     container headings.
 
-    For buys, the public entry is scanned for deal-identifying content
-    BEFORE any external write; a surviving company name / founder / exact
-    figure / review marker aborts the entire publish (both docs) unless
-    `force=True`.
+    For buys, the public entry is scanned for deal-identifying content and
+    requires a human approval receipt bound to the exact public-entry hash.
+    `force` never bypasses this privacy gate.
 
     Raises:
       FileNotFoundError: cached entry files are missing. Run `memo` first.
@@ -308,8 +309,9 @@ def publish_decision_to_docs(folder: Path, config: Config, *, force: bool = Fals
     # retry can't leave the private doc appended while the public leg is
     # blocked).
     public_entry = _load_public_entry(folder) if is_buy else None
-    if public_entry is not None and not force:
+    if public_entry is not None:
         _guard_public_entry(folder, decision, public_entry)
+        _check_public_approval(folder, public_entry)
 
     insert_private_entry(
         config.private_doc_id,
@@ -336,6 +338,7 @@ def _guard_public_entry(
     the (cached) AngelList parse."""
     al_company: str | None = None
     founders: list[str] = []
+    angellist: AngelListMetadata | None = None
     try:
         materials = load_materials(folder)
         angellist = load_or_parse_angellist(folder, materials)
@@ -347,6 +350,28 @@ def _guard_public_entry(
         pass
 
     aliases = [al_company] if al_company and al_company != decision.company else []
+    private_values: list[float] = []
+    if angellist is not None:
+        private_values.extend(
+            value
+            for value in (
+                angellist.pre_money_usd,
+                angellist.estimated_round_size_usd,
+                angellist.allocation_usd,
+                angellist.leads_investment_usd,
+                angellist.min_investment_usd,
+                angellist.total_prior_capital_usd,
+            )
+            if value is not None
+        )
+    configured_terms = [
+        term.strip()
+        for term in os.environ.get("ANGEL_MEMOS_PRIVATE_ONLY_TERMS", "").split(",")
+        if term.strip()
+    ]
+    source_private_terms = list(angellist.co_investors) if angellist is not None else []
+    if decision.current_base_metric_usd is not None:
+        private_values.append(decision.current_base_metric_usd)
     leaks = find_public_leaks(
         public_entry.model_dump_json(),
         company=decision.company,
@@ -354,9 +379,61 @@ def _guard_public_entry(
         founders=founders,
         check_usd=decision.check_usd,
         post_money_usd=decision.post_money_usd,
+        private_values=private_values,
+        private_only_terms=[
+            *configured_terms,
+            *source_private_terms,
+            *public_entry.private_only_terms,
+        ],
     )
     if leaks:
         raise PublicMemoLeakError(leaks)
+
+
+def public_entry_hash(public_entry: PublicDocEntry) -> str:
+    """Hash the exact serialized public output that a human approved."""
+    payload = public_entry.model_dump(exclude={"approval_sha256"}, mode="json")
+    return hashlib.sha256(json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def approve_public_entry(folder: Path, *, approved_by: str) -> Path:
+    """Record explicit human approval for the current public entry bytes."""
+    if not approved_by.strip():
+        raise ValueError("approved_by must not be empty")
+    entry = _load_public_entry(folder)
+    path = folder / _PUBLIC_APPROVAL_FILENAME
+    approval_hash = public_entry_hash(entry)
+    approved_entry = entry.model_copy(update={"approval_sha256": approval_hash})
+    (folder / _PUBLIC_ENTRY_FILENAME).write_text(
+        approved_entry.model_dump_json(indent=2), encoding="utf-8"
+    )
+    path.write_text(
+        json.dumps({"public_sha256": approval_hash, "approved_by": approved_by.strip()}, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _check_public_approval(folder: Path, public_entry: PublicDocEntry) -> None:
+    path = folder / _PUBLIC_APPROVAL_FILENAME
+    if not path.is_file():
+        raise RuntimeError(
+            "public entry lacks human approval; run `angel-memos approve-public` after review"
+        )
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("public approval receipt is invalid; review and approve again") from exc
+    expected_hash = public_entry_hash(public_entry)
+    if (
+        receipt.get("public_sha256") != expected_hash
+        or public_entry.approval_sha256 != expected_hash
+        or not str(receipt.get("approved_by", "")).strip()
+    ):
+        raise RuntimeError(
+            "public approval receipt does not match the exact public output; review and approve again"
+        )
 
 
 # ---------------------------------------------------------------------------

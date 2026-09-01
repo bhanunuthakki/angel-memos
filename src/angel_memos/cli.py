@@ -30,6 +30,7 @@ from angel_memos.config import Config, load_config
 from angel_memos.diligence import run_diligence_phase
 from angel_memos.ingest import IngestResult, default_inbox, run_ingest
 from angel_memos.memo import (
+    approve_public_entry,
     parse_decision,
     publish_decision_to_docs,
     run_memo_phase,
@@ -100,11 +101,7 @@ def diligence(company: str, folder: Path | None) -> None:
     "--force",
     is_flag=True,
     default=False,
-    help=(
-        "Bypass the public-memo leak gate and publish even if the anonymized "
-        "entry still contains an identifier (use only after reviewing a false "
-        "positive)."
-    ),
+    help=("Allow stale cached entries; privacy checks and approval are never bypassed."),
 )
 def memo(
     company: str,
@@ -132,6 +129,20 @@ def memo(
         click.echo("Skipped Google Docs append (--no-docs).")
     else:
         click.echo("Published to Google Docs.")
+
+
+@main.command()
+@click.argument("company")
+@click.option("--folder", type=click.Path(path_type=Path), default=None)
+@click.option(
+    "--approved-by", required=True, help="Human reviewer who approved this exact public output."
+)
+def approve_public(company: str, folder: Path | None, approved_by: str) -> None:
+    """Approve the exact cached public entry for later external publication."""
+    cfg = load_config()
+    target = _resolve_company_folder(company, folder, cfg)
+    path = approve_public_entry(target, approved_by=approved_by)
+    click.echo(f"Wrote approval receipt {path}")
 
 
 @main.command()
@@ -392,7 +403,7 @@ def dashboard(port: int, no_browser: bool) -> None:
     "--force",
     is_flag=True,
     default=False,
-    help="Bypass the public-memo leak gate (use only after reviewing a false positive).",
+    help="Allow stale cached entries; privacy checks and approval are never bypassed.",
 )
 def publish(company: str, folder: Path | None, force: bool) -> None:
     """Re-publish a company's cached structured entries to the Google Docs

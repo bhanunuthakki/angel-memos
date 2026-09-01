@@ -313,6 +313,11 @@ def _build_public_blocks(entry: PublicDocEntry) -> list[Block]:
     """Compose the block list for one public-doc entry per the style guide."""
     blocks: list[Block] = [
         Block(text=public_entry_heading(entry), style="heading_4"),
+        *(
+            [Block(text=f"Public approval: sha256:{entry.approval_sha256}", style="normal")]
+            if entry.approval_sha256
+            else []
+        ),
         Block(text=f"Date: {entry.date_label}", style="normal"),
     ]
     blocks.extend(_paragraph_with_bold_prefix("What does it do?", entry.what_does_it_do))
