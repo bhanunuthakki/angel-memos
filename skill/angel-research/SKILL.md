@@ -1,6 +1,6 @@
 ---
 name: angel-research
-description: Deep, evidence-grounded research on an angel deal after the quick screen and before angel-decide. Use an adaptive Fable/Sol-led research pass with one to three bounded workhorse agents, targeted skepticism for load-bearing claims, and a final research_memo.md plus refreshed score.
+description: Deep, evidence-grounded research on an angel deal after the quick screen and before angel-decide. Adapt research depth to the deal's load-bearing uncertainties, use bounded independent slices only when they improve coverage, and produce research_memo.md plus a refreshed score.
 ---
 
 # Angel research
@@ -59,15 +59,15 @@ founder evidence, comparables, kill conditions, and open questions.
 
 ## Orchestration
 
-The primary Fable/Sol session owns scoping, synthesis, and the final verdict.
+The primary session owns scoping, synthesis, and the final recommendation.
 Do not delegate a narrow deal that can be researched coherently in the root
 session. Otherwise choose one to three independent research slices based on
 the deal's actual uncertainty; do not launch every module by default.
 
-For each spawned session, name the model and reason:
-
-- Sonnet/Terra workhorse: web research, technical diligence, analysis.
-- Haiku/Luna mechanical: bounded extraction or source normalization only.
+For each spawned session, name the required capability and why delegation improves evidence or
+elapsed time. Use a capable general research worker for substantive diligence. Use a faster or
+lower-cost worker only for bounded extraction or source normalization whose correctness can be
+checked deterministically. Do not encode transient model names in this workflow.
 
 Keep delegation depth at one and no more than three concurrent agents. Agents
 are read-only and return structured findings to the orchestrator; the root
@@ -108,7 +108,7 @@ user explicitly requests an exhaustive pass, and act on that critique once.
 
 ## Synthesis and score refresh
 
-The Fable/Sol orchestrator writes `research_memo.md` following
+The primary session writes `research_memo.md` following
 `memo_template.md`, including all 13 sections. Mark hard-tech sections
 `N/A (software)` only when genuinely inapplicable. The Investment Shape
 section must include the milestone ladder, risk retired at each milestone,

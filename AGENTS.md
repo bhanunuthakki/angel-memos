@@ -1,36 +1,45 @@
 # Angel Memos — Project Instructions
 
-Layers on top of the global `~/.gemini/AGENTS.md`. This repo generates two-mode adversarial investment memos (private + masked public) for angel-stage deals, plus a stage-appropriate exit-math sheet, from materials dropped into a company folder on Google Drive.
+Layers on top of the runtime's global agent safety, authority, and procedure contract. This repo generates a private adversarial memo for every angel-stage decision, a masked public memo for buy decisions, and stage-appropriate exit math when the decision schema requires it.
 
 ## Architecture
 
-The full pipeline: `extension capture → ingest → quick screen (diligence + score) → [deep research] → decide → memo`.
+The user-visible pipeline is `capture → ingest → quick screen → optional deep research → decide → memo/publish`.
+Each stage has one authority:
 
-1. **Python CLI `angel-memos`** (`src/angel_memos/cli.py`):
-   - `diligence <company>` → writes `diligence_topics.html` into the company folder.
-   - `score <company>` → versioned rubric scorecard (`scoring.py`; saved policy in `SCORING_RUBRIC.md`) → `score_report.json` + `score_report.md`. V2.2 is the default comp-free screen; earlier versions remain historical rollback contracts. V2.2 uses one common total with archetype-specific evidence anchors, separate commercial-evidence/defensibility/execution-capital factors, and a 15% co-investor signal. Comparable valuations are neither researched nor weighted during scoring; terms and return benchmarks belong to `/angel-decide` and exit math. Evidence gates constrain the effective band; `--archetype` can override governed auto-classification. Archetype-aware versions use self-consistent LLM judges plus an adversarial critique. Auto-upgrades to tier=deep when `research_memo.md` exists. ADVISORY — never writes `decision.md`.
-   - `memo <company>` → reads `decision.md` + materials, writes `memo_private.md`, `memo_public.md`, `exit_math.xlsx`, and appends to two Google Docs.
-   - `ingest` / `watch` (`ingest.py`) → move Chrome-extension drops from `~/Downloads/angel-memos/<Company>/` into `Evaluation/<Company>/`; `watch` is the daemon that also auto-runs the quick tier (diligence + score) when the drop's `job.json` says `tier: quick`. The extension writes `job.json` LAST; it is the drop-completeness marker.
-     - **Dedupe is by content, never by filename.** A source file whose SHA-256 already matches a file in the company folder is discarded instead of landing as `… (2).pdf` — the same PDF re-captured by the extension and by a manual save have different names. A same-named file with *different* bytes is a different document and is always kept (suffixed); re-captures are only ever deleted on an exact byte match.
-     - Every ingest pass prunes empty drop directories from the Downloads inbox. A drop still holding files is never pruned — no `job.json` means an incomplete capture, not litter.
-     - **Rounds get their own folders.** The same company returns round after round, and those are separate deals with separate terms. Ingest reads the round from the incoming AL memo's TERMS table (deterministic text-layer parse, no LLM) and compares it to the destination's — `.angellist_cache.json`'s `stage` first, else the folder's own AL memo. A round no existing folder holds lands in a suffixed sibling, `Acme (Series B)`. Comparison is on the canonical `Stage`, so `Series C` and `Series C+` are one round. Ingest forks **only on positive evidence of a different round**: an unreadable round on either side merges, because splitting one deal across two folders is worse than a merge the byte-dedupe already handles.
-   - `investors backfill|export` (`investors.py`) → persistent cross-deal investor DB. SQLite at `~/.angel-memos/investors.db` — deliberately OUTSIDE Drive (Drive sync corrupts sqlite); readable view exported to the Drive root as `investors.md`. Records stale after 180 days; re-researched on next lookup.
-2. **Project-local skills** (`skill/`). When either workflow matches the task,
-   every runtime reads its `SKILL.md` completely before acting; Claude may
-   auto-load it, while Codex and Gemini follow this rulebook pointer:
-   - `angel-decide` — conversational Q&A producing a schema-validated `decision.md`. Reads `score_report.json` and `research_memo.md` as advisory inputs when present. Runs *between* the quick screen and `memo`.
-   - `angel-research` — deep-tier research (~30-60 min, launched deliberately). Fable/Sol selects one to three independent workhorse slices from technical diligence, techno-economics, market structure, and moat/incumbent response; a targeted skeptic is used only for unresolved load-bearing claims. The primary session synthesizes `research_memo.md` and re-runs `angel-memos score` at deep tier.
-3. **Five xlsx templates** (`templates/`) — one per valuation method. `memo` populates the appropriate one based on `decision.valuation_method`.
-4. **Chrome extension** (`extension/`, MV3, load-unpacked) — one-click capture on AngelList deal pages: prints the page to PDF as `angellist - <Company>.pdf`, downloads attachment links, writes `job.json` last into `Downloads/angel-memos/<Company>/`.
+- `src/angel_memos/cli.py` owns commands and company-folder resolution. `diligence` writes
+  `diligence_topics.html`; `score` writes the advisory `score_report.json` and
+  `score_report.md` governed by `SCORING_RUBRIC.md`; neither decides or writes `decision.md`.
+- `skill/angel-research/SKILL.md` owns optional deep research and `research_memo.md` synthesis.
+  Load it completely only when that workflow is requested.
+- `skill/angel-decide/SKILL.md` owns the stateful interview and schema-validated `decision.md`.
+  Load it completely only when that workflow is requested. The user owns the decision.
+- `memo <company>` reads the validated decision and always produces `memo_private.md` and
+  `private_entry.json`. It produces `memo_public.md` and `public_entry.json` only for `buy` or
+  `strong_buy`; it produces `exit_math.xlsx` for every non-`pass`, non-`custom` decision,
+  including `hold`. Unless `--no-docs` is passed it also attempts the applicable Google Docs
+  append; exact public output requires human approval before `publish` can write it externally.
+- `docs/INGEST_CONTRACT.md` owns the drop-completeness, content-deduplication, and round-routing
+  behavior of `ingest` and `watch`; `src/angel_memos/ingest.py` is executable authority.
+- `src/angel_memos/exit_math.py` owns workbook generation. The repository contains no spreadsheet
+  templates; tests generate controlled workbooks.
+- `src/angel_memos/dashboard.py` owns the localhost deal dashboard. `extension/` owns the MV3
+  AngelList capture overlay; `extension/README.md` owns its installation and operator workflow.
+- `src/angel_memos/investors.py` owns the local cross-deal investor database at
+  `~/.angel-memos/investors.db`; `investors.md` is its Drive-safe readable export.
 
-The CLI never asks questions. The skills never write the post-decision memos. The score never decides. Each tool lives in its native medium.
+The CLI does not conduct interviews, the skills do not write post-decision memo artifacts, and the
+score remains advisory. Use `memo --no-docs` for local generation without external writes, then
+review and approve the exact public artifact before a separate publication when applicable. Once the
+target and exact public artifact are approved, publish that artifact without reopening its copy or
+substituting the private memo, then report the publication result and destination.
 
 ## Folder contract per company
 
 ```
-<Evaluation|Portfolio>/<Company>/
+<Evaluation|Portfolio|Passed>/<Company>/
   angellist*.pdf             # required input — terms + narrative; source of `stage`
-  deck*.pdf                  # input — pitch deck (passed multimodal to Claude)
+  deck*.pdf                  # input — pitch deck
   *.md, *.txt                # input — your call notes, public-link lists
   diligence_topics.html      # Phase A output (quick screen)
   score_report.json          # `score` output — rubric scorecard, consumed by /angel-decide
@@ -39,21 +48,23 @@ The CLI never asks questions. The skills never write the post-decision memos. Th
   decision.md                # /angel-decide output (YAML frontmatter + prose body)
   decision_review.md         # `review` output — adversarial pressure-test
   memo_private.md            # Phase B output
-  memo_public.md             # Phase B output (masked)
-  exit_math.xlsx             # Phase B output (omitted iff verdict==pass OR method==custom)
+  private_entry.json         # structured private memo entry
+  memo_public.md             # masked output (buy and strong_buy only)
+  public_entry.json          # structured public entry (buys only)
+  exit_math.xlsx             # output for buy, strong_buy, or hold; omitted for pass or custom
 ```
 
-On invest, `mv Evaluation/<Company> Portfolio/<Company>`. No deeper nesting in `Portfolio/`.
+On `buy` or `strong_buy`, move `Evaluation/<Company>` to `Portfolio/<Company>`; on `pass`, move it to `Passed/<Company>`. No deeper nesting in those roots; a `hold` move remains an owner decision.
 
-Cross-deal state (outside the folder contract): `~/.angel-memos/investors.db` (sqlite, local-only) and `investors.md` exported next to the Evaluation/Portfolio roots.
+Cross-deal state (outside the folder contract): `~/.angel-memos/investors.db` (sqlite, local-only) and `investors.md` exported to the configured Drive root.
 
 ## Domain rules
 
 - **Stage** is extracted from the AngelList memo's TERMS table (`Round` field), never from `decision.md` or inferred from materials.
-- **Valuation method** is per-deal, proposed by `/angel-decide` (Claude reasoning) and confirmed by you. One of: `arr_multiple`, `revenue_ebitda`, `revenue_pe`, `gmv_take`, `seed_outcome`, `custom`.
-- **Benchmarks are required** for every decision except `verdict == pass` or `valuation_method == custom`. They anchor terminal-metric reach AND exit multiple to named comparables — no scenario priors without a real-world reference.
+- **Valuation method** is per-deal, proposed through `/angel-decide` and confirmed by the user. One of: `arr_multiple`, `revenue_ebitda`, `revenue_pe`, `gmv_take`, `seed_outcome`, `custom`.
+- **Benchmarks are required** for every decision except `verdict == pass` or `valuation_method == custom`; this includes `hold`. They anchor terminal-metric reach and exit multiple to named comparables — no scenario priors without a real-world reference.
 - **Scenario probabilities sum to 1.0** (validator-enforced; tolerance 1e-6).
-- **Public memo** is mechanically derived from the private memo by string substitution of mask terms (company name, founder names from AL memo, check size, post-money valuation, any `private_only_terms` Claude tags during generation).
+- **Public memo** is mechanically derived from the private memo by string substitution of mask terms: company and founder names, check size, post-money valuation, and generator-tagged `private_only_terms`.
 
 ## Agent and application model routing
 
@@ -84,17 +95,24 @@ file.
 
 ## Testing
 
-- Use the runtime's `code-change` procedure. Schemas have their tests; orchestration tests mock the Claude call.
-- Golden fixtures live in `tests/fixtures/`:
-  - `SpotAI_AL_Details.pdf` — AngelList parser fixture
-  - `SpotAI_Exit_Math.xlsx` — `arr_multiple` template golden output
-- Never assert on Claude prompt wording or memo copy. Test structural properties: schema validates, output non-empty, mask-list applied, expected files written.
+- Use the runtime's `code-change` procedure. Schemas have their tests; orchestration tests mock the application LLM boundary.
+- The AngelList parser fixture is `tests/fixtures/spotai_al.pdf`; exit-math tests generate controlled workbooks rather than depending on a checked-in template.
+- Never assert on provider prompt wording or memo copy. Test structural properties: schema validates, output non-empty, mask-list applied, expected files written.
 
-## Pre-push checklist
+## Repository validation before a push or release
 
 1. `uv sync --extra dev` (plain `uv sync` PRUNES pytest/ruff/pyright from the venv)
-2. `ruff format .`
-3. `ruff check .`
-4. `pyright`
-5. `basedpyright`
-6. `pytest`
+2. `uv run ruff format .`
+3. `uv run ruff check .`
+4. `uv run pyright`
+5. `uv run basedpyright`
+6. `uv run pytest`
+7. `bash scripts/check_public_tree.sh` — the configured pre-push hook and public-boundary gate
+
+## Interface
+
+- Profile: dense-desktop
+- Contract: docs/UI_CONTRACT.md
+- Executable authority: src/angel_memos/dashboard.py, extension/content.js
+- Render: `uv run angel-memos dashboard --no-browser`, then inspect the affected dashboard task at 1440 × 900; extension changes also require the load-unpacked flow in `extension/README.md`
+- Gate: `uv run pytest -q tests/test_dashboard.py && node --check extension/content.js && node --check extension/background.js`
