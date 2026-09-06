@@ -43,3 +43,27 @@ with the destination AngelList memo.
 Ingest writes company-folder material and inbox state. It does not decide the deal or write
 `decision.md`, research synthesis, or post-decision memo artifacts. A watcher is an owned daemon:
 report it as running rather than complete, and stop or explicitly hand it off when the task ends.
+
+## Company-folder artifact and routing contract
+
+```
+<Evaluation|Portfolio|Passed>/<Company>/
+  angellist*.pdf             # required input — terms + narrative; source of `stage`
+  deck*.pdf                  # input — pitch deck
+  *.md, *.txt                # input — your call notes, public-link lists
+  diligence_topics.html      # Phase A output (quick screen)
+  score_report.json          # `score` output — rubric scorecard, consumed by /angel-decide
+  score_report.md            # `score` output — readable scorecard
+  research_memo.md           # /angel-research output (deep tier; optional)
+  decision.md                # /angel-decide output (YAML frontmatter + prose body)
+  decision_review.md         # `review` output — adversarial pressure-test
+  memo_private.md            # Phase B output
+  private_entry.json         # structured private memo entry
+  memo_public.md             # masked output (buy and strong_buy only)
+  public_entry.json          # structured public entry (buys only)
+  exit_math.xlsx             # output for buy, strong_buy, or hold; omitted for pass or custom
+```
+
+On `buy` or `strong_buy`, move `Evaluation/<Company>` to `Portfolio/<Company>`; on `pass`, move it to `Passed/<Company>`. No deeper nesting in those roots; a `hold` move remains an owner decision.
+
+Cross-deal state (outside the folder contract): `~/.angel-memos/investors.db` (sqlite, local-only) and `investors.md` exported to the configured Drive root.
