@@ -2,7 +2,15 @@
 
 Layers on top of the runtime's global agent safety, authority, and procedure contract. This repo generates a private adversarial memo for every angel-stage decision, a masked public memo for buy decisions, and stage-appropriate exit math when the decision schema requires it.
 
-## Architecture
+## Purpose and improvement latitude
+
+Help the owner reach a better angel-investment decision with less clerical work and sharper challenge.
+Within authorized work, improve capture completeness, source comparison, diligence questions,
+sensitivity analysis, and clarity of the next valid action. Make disconfirming evidence easy to find.
+Restructure research or simplify a stage when it strengthens those outcomes; distinguish estimates
+from evidence and leave the verdict, valuation-method confirmation, and public approval with the owner.
+
+## Authority map
 
 The user-visible pipeline is `capture → ingest → quick screen → optional deep research → decide → memo/publish`.
 Each stage has one authority:
@@ -34,29 +42,11 @@ review and approve the exact public artifact before a separate publication when 
 target and exact public artifact are approved, publish that artifact without reopening its copy or
 substituting the private memo, then report the publication result and destination.
 
-## Folder contract per company
+## Company-folder authority
 
-```
-<Evaluation|Portfolio|Passed>/<Company>/
-  angellist*.pdf             # required input — terms + narrative; source of `stage`
-  deck*.pdf                  # input — pitch deck
-  *.md, *.txt                # input — your call notes, public-link lists
-  diligence_topics.html      # Phase A output (quick screen)
-  score_report.json          # `score` output — rubric scorecard, consumed by /angel-decide
-  score_report.md            # `score` output — readable scorecard
-  research_memo.md           # /angel-research output (deep tier; optional)
-  decision.md                # /angel-decide output (YAML frontmatter + prose body)
-  decision_review.md         # `review` output — adversarial pressure-test
-  memo_private.md            # Phase B output
-  private_entry.json         # structured private memo entry
-  memo_public.md             # masked output (buy and strong_buy only)
-  public_entry.json          # structured public entry (buys only)
-  exit_math.xlsx             # output for buy, strong_buy, or hold; omitted for pass or custom
-```
-
-On `buy` or `strong_buy`, move `Evaluation/<Company>` to `Portfolio/<Company>`; on `pass`, move it to `Passed/<Company>`. No deeper nesting in those roots; a `hold` move remains an owner decision.
-
-Cross-deal state (outside the folder contract): `~/.angel-memos/investors.db` (sqlite, local-only) and `investors.md` exported to the configured Drive root.
+`docs/INGEST_CONTRACT.md` owns the complete folder/artifact inventory and verdict-based moves.
+Read it before ingest, folder routing, or artifact changes. The root session is the sole writer of
+company-folder outputs; research workers return evidence without mutating deal state.
 
 ## Domain rules
 
@@ -68,10 +58,8 @@ Cross-deal state (outside the folder contract): `~/.angel-memos/investors.db` (s
 
 ## Agent and application model routing
 
-Interactive research follows the runtime's `agent-operations` procedure. The
-repo-specific constraint is:
-the root session has sole ownership of company-folder writes — workers never
-touch `decision.md`, memo files, or other company-folder outputs.
+Interactive research follows the runtime's `agent-operations` procedure and the company-folder
+writer boundary above.
 
 Application LLM calls remain separate from interactive agent routing. They use
 the runtime's membership transport contract and
@@ -88,8 +76,6 @@ file.
   change the research task.
 - Material claims record a source, source type, and freshness date. Label
   estimates and reconcile conflicting numbers explicitly.
-- The primary session is the sole writer of `research_memo.md` and
-  `decision.md`. Workers return findings without mutating deal state.
 - Private deal materials, check sizes, and decision reasoning stay within the
   configured company folder and approved local tools.
 
