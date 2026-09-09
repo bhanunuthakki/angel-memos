@@ -1,7 +1,7 @@
 """Dashboard pure-logic: pipeline stage detection from folder contents,
-Markdown rendering, deal resolution, and the Claude Code launch command.
+Markdown rendering, deal resolution, and the interactive-agent launch command.
 
-The HTTP layer and in-process job runner (which touch Claude) are not
+The HTTP layer and in-process job runner (which touch the active agent) are not
 exercised here — only the dependency-free logic that carries the behavior."""
 
 from pathlib import Path
@@ -151,14 +151,17 @@ def test_list_deals_reports_furthest_stage(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Claude Code launch command
+# Interactive-agent launch command
 # ---------------------------------------------------------------------------
 
 
-def test_decide_launch_command_mentions_company_and_skill() -> None:
+def test_decide_launch_command_uses_fleet_backend_and_mentions_company_and_skill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("angel_memos.dashboard._subscription_backends", lambda: ("codex",))
     cmd = decide_launch_command("Acme Corp")
     joined = " ".join(cmd)
-    assert "claude" in cmd
+    assert "codex" in cmd
     assert "/angel-decide" in joined
     assert "Acme Corp" in joined
 

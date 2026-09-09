@@ -265,8 +265,8 @@ def watch(inbox: Path | None, interval: int) -> None:
     """Daemon: ingest extension drops and auto-run quick research.
 
     For drops whose job.json requested tier=quick, runs diligence + score
-    in-process (Claude via subscription CLI). Deep research is deliberate:
-    launch /angel-research from a Claude Code session. Ctrl+C to stop."""
+    in-process through the shared subscription route. Deep research is deliberate:
+    launch /angel-research from an interactive agent session. Ctrl+C to stop."""
     cfg = load_config()
     target_inbox = inbox or default_inbox()
 
@@ -279,7 +279,7 @@ def watch(inbox: Path | None, interval: int) -> None:
             for result in run_ingest(target_inbox, cfg, on_error=_on_ingest_error):
                 _echo_ingest(result)
                 if result.job.tier == "quick":
-                    # Isolate quick-tier failures per drop: a transient Claude
+                    # Isolate quick-tier failures per drop: a transient agent
                     # error on one company must not abort ingestion of the rest
                     # or wedge the daemon.
                     try:
@@ -385,7 +385,7 @@ def dashboard(port: int, no_browser: bool) -> None:
 
     Per-deal pipeline view (save info → quick brief → diligence & decision →
     publish): click into every artifact, run each step, and open the Q&A in a
-    Claude Code session. Ctrl+C to stop."""
+    fleet-selected interactive agent session. Ctrl+C to stop."""
     from angel_memos.dashboard import serve
 
     serve(load_config(), port=port, open_browser=not no_browser)

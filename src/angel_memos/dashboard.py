@@ -4,12 +4,12 @@ A browser front-end over one company folder: it reads which artifacts exist,
 lays the deal out as a pipeline (save info -> quick brief -> diligence & decision
 -> publish), lets you click into every artifact (AL memo PDF, deck PDF, the
 diligence brief, the scorecard, the decision), and runs each pipeline step with
-one button. The Q&A step redirects you into a Claude Code session running
-`/angel-decide` for the deal, since that conversation lives in Claude, not here.
+one button. The Q&A step redirects you into the interactive agent selected by
+the shared fleet policy and asks it to run `/angel-decide` for the deal.
 
 Design:
   - The stage/artifact detection and Markdown rendering are pure functions
-    (`scan_deal`, `render_markdown`) with no Claude / network / server
+    (`scan_deal`, `render_markdown`) with no agent / network / server
     dependency — they carry the tests.
   - The HTTP layer is a thin stdlib `http.server` on top. No web framework
     dependency; this is a single-user localhost tool.
@@ -39,6 +39,7 @@ from urllib.parse import unquote
 from pydantic import BaseModel, ConfigDict
 
 from angel_memos.config import Config, load_config
+from angel_memos.llm import _subscription_backends
 from angel_memos.materials import MaterialsError, load_materials
 
 # ---------------------------------------------------------------------------
@@ -65,7 +66,7 @@ class Artifact(BaseModel):
 
 class Action(BaseModel):
     """One runnable pipeline step. `cli` runs a phase in-process; `launch`
-    shells out to open a Claude Code session (the Q&A redirect)."""
+    shells out to open an interactive agent session (the Q&A redirect)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -181,14 +182,14 @@ def scan_deal(company: str, folder: Path, location: Location) -> DealState:
             key="decision",
             label="3 · Diligence & decision",
             status=_all_or_partial(decision_arts, blocked=not has_al),
-            blurb="Ask questions of Claude, then capture the decision. The Q&A runs in Claude Code.",
+            blurb="Ask questions with the active agent, then capture the decision.",
             artifacts=decision_arts,
             actions=[
                 Action(
                     key="decide",
-                    label="Open Q&A in Claude Code",
+                    label="Open Q&A in agent",
                     kind="launch",
-                    desc="Runs /angel-decide for this deal in a Claude Code session",
+                    desc="Runs /angel-decide for this deal in the fleet-selected agent",
                 ),
                 Action(
                     key="review",
@@ -297,21 +298,24 @@ def list_deals(cfg: Config) -> list[DealSummary]:
 
 
 # ---------------------------------------------------------------------------
-# Claude Code redirect for the Q&A step.
+# Interactive-agent redirect for the Q&A step.
 # ---------------------------------------------------------------------------
 
 
 def decide_launch_command(company: str) -> list[str]:
-    """Command that opens a Claude Code session seeded to run /angel-decide.
+    """Open the fleet-selected interactive agent, seeded to run /angel-decide.
 
     On Windows this opens a new console window (`start`) so the chat is
     interactive and visible. The seed prompt triggers the angel-decide skill
     for the deal; the user drives the Q&A from there."""
+    backend = _subscription_backends()[0]
+    executable = {"codex": "codex", "claude": "claude"}.get(backend)
+    if executable is None:
+        raise RuntimeError(f"No interactive agent adapter is registered for backend {backend!r}")
     prompt = f'Run the /angel-decide skill for the deal "{company}".'
     if os.name == "nt":
-        # `start "" cmd /k claude "<prompt>"` — empty title arg, keep window open.
-        return ["cmd", "/c", "start", "", "cmd", "/k", "claude", prompt]
-    return ["claude", prompt]
+        return ["cmd", "/c", "start", "", "cmd", "/k", executable, prompt]
+    return [executable, prompt]
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +621,7 @@ def make_server(cfg: Config, port: int) -> ThreadingHTTPServer:
                 try:
                     subprocess.Popen(decide_launch_command(company), cwd=str(folder))
                     self._send_json(
-                        _json({"ok": True, "launched": True, "message": "Opening Claude Code…"})
+                        _json({"ok": True, "launched": True, "message": "Opening agent…"})
                     )
                 except OSError as exc:
                     self._send_json(_json({"ok": False, "error": str(exc)}), 500)

@@ -11,7 +11,7 @@ heavy synthesis calls produce reliably deep output.
 import tempfile
 from pathlib import Path
 
-from angel_memos.claude import Purpose, extract_structured
+from angel_memos.llm import Purpose, extract_structured
 from angel_memos.models import DeckContent
 from angel_memos.pdf_utils import rasterize_pdf
 

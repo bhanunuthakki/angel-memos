@@ -36,7 +36,6 @@ from pathlib import Path
 
 import yaml
 
-from angel_memos.claude import Purpose, call_llm
 from angel_memos.config import Config, load_config
 from angel_memos.doc_entries import (
     PrivateDocEntry,
@@ -47,6 +46,7 @@ from angel_memos.doc_entries import (
 )
 from angel_memos.exit_math import generate_exit_math
 from angel_memos.google_docs import insert_private_entry, insert_public_entry
+from angel_memos.llm import Purpose, call_llm
 from angel_memos.masking import PublicMemoLeakError, find_public_leaks
 from angel_memos.materials import (
     Materials,

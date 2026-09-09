@@ -29,8 +29,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from angel_memos.claude import LlmCallError
 from angel_memos.config import Config
+from angel_memos.llm import LlmCallError
 from angel_memos.models import AngelListMetadata
 
 DATA_DIR_ENV_VAR = "ANGEL_MEMOS_DATA_DIR"
@@ -196,7 +196,7 @@ def build_grade_prompt(name: str, context: str) -> str:
 def grade_investor(name: str, context: str) -> InvestorResearch:
     """Web-research one investor and return a graded profile.
     ~$0.05 / 30s per call; results persist in the DB for 180 days."""
-    from angel_memos.claude import Purpose, extract_structured
+    from angel_memos.llm import Purpose, extract_structured
 
     return extract_structured(
         build_grade_prompt(name, context),

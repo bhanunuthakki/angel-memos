@@ -21,7 +21,7 @@ def _no_sleep(_seconds: float) -> None:
     return None
 
 
-def test_call_llm_uses_openrouter_then_codex_after_claude_failure(
+def test_call_llm_follows_fleet_route_after_backend_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -30,10 +30,6 @@ def test_call_llm_uses_openrouter_then_codex_after_claude_failure(
     def fail_claude(*_args: object, **_kwargs: object) -> claude.TransportResult:
         calls.append("claude")
         raise RuntimeError("subscription unavailable")
-
-    def fail_openrouter(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        calls.append("openrouter")
-        raise RuntimeError("metered fallback unavailable")
 
     def succeed_codex(*_args: object, **_kwargs: object) -> claude.TransportResult:
         calls.append("codex")
@@ -44,14 +40,32 @@ def test_call_llm_uses_openrouter_then_codex_after_claude_failure(
         )
 
     monkeypatch.setattr(claude, "_call_claude_transport", fail_claude)
-    monkeypatch.setattr(claude, "_call_openrouter_transport", fail_openrouter)
     monkeypatch.setattr(claude, "_call_codex_transport", succeed_codex)
+    monkeypatch.setattr(claude, "_subscription_backends", lambda: ("claude", "codex"))
     monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(tmp_path / "llm_calls.jsonl"))
 
     result = claude.call_llm("private prompt", purpose=claude.Purpose.DILIGENCE_TOPICS)
 
     assert result == "fallback answer"
-    assert calls == ["claude", "openrouter", "codex"]
+    assert calls == ["claude", "codex"]
+
+
+def test_judge_purposes_use_the_explicit_shared_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[bool] = []
+
+    def route(*, judge: bool = False) -> tuple[str, ...]:
+        calls.append(judge)
+        return ("claude", "codex")
+
+    monkeypatch.setattr(claude, "_subscription_backends", route)
+
+    assert claude._backends_for_purpose(claude.Purpose.SCORE_MARKET) == (
+        "claude",
+        "codex",
+    )
+    assert calls == [True]
 
 
 def test_call_llm_ledger_hashes_private_text(
@@ -69,6 +83,7 @@ def test_call_llm_ledger_hashes_private_text(
         )
 
     monkeypatch.setattr(claude, "_call_claude_transport", succeed)
+    monkeypatch.setattr(claude, "_subscription_backends", lambda: ("claude",))
     ledger_path = tmp_path / "llm_calls.jsonl"
     monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(ledger_path))
 
@@ -87,24 +102,16 @@ def test_extract_structured_repairs_once_before_advancing_provider(
     tmp_path: Path,
 ) -> None:
     calls: list[str] = []
-    openrouter_replies = iter(['{"score": 150}', '{"score": 82}'])
-
-    def fail_claude(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        calls.append("claude")
-        raise RuntimeError("subscription unavailable")
-
-    def openrouter(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        calls.append("openrouter")
-        text = next(openrouter_replies)
-        return claude.TransportResult(text=text, input_tokens=10, output_tokens=3)
+    codex_replies = iter(['{"score": 150}', '{"score": 82}'])
 
     def codex(*_args: object, **_kwargs: object) -> claude.TransportResult:
         calls.append("codex")
-        return claude.TransportResult(text='{"score": 1}', input_tokens=10, output_tokens=3)
+        return claude.TransportResult(
+            text=next(codex_replies), input_tokens=10, output_tokens=3
+        )
 
-    monkeypatch.setattr(claude, "_call_claude_structured_transport", fail_claude)
-    monkeypatch.setattr(claude, "_call_openrouter_transport", openrouter)
     monkeypatch.setattr(claude, "_call_codex_transport", codex)
+    monkeypatch.setattr(claude, "_subscription_backends", lambda: ("codex",))
     monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(tmp_path / "llm_calls.jsonl"))
 
     result = claude.extract_structured(
@@ -114,12 +121,12 @@ def test_extract_structured_repairs_once_before_advancing_provider(
     )
 
     assert result.score == 82
-    assert calls == ["claude", "openrouter", "openrouter"]
+    assert calls == ["codex", "codex"]
 
 
 def test_application_call_sites_use_only_the_governed_entry_point() -> None:
     package = Path(__file__).parents[1] / "src" / "angel_memos"
-    exempt = {"claude.py", "claude_cli.py"}
+    exempt = {"llm.py", "claude.py", "claude_cli.py"}
     violations = [
         path.name
         for path in package.glob("*.py")
@@ -292,6 +299,7 @@ def test_structured_codex_operational_failure_retries_once(
     monkeypatch.setattr(claude, "_call_claude_structured_transport", fail_primary)
     monkeypatch.setattr(claude, "_call_openrouter_transport", fail_openrouter)
     monkeypatch.setattr(claude, "_call_codex_transport", codex)
+    monkeypatch.setattr(claude, "_backends_for_purpose", lambda _purpose: ("codex",))
     monkeypatch.setattr(claude.time, "sleep", _no_sleep)
     monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(tmp_path / "llm_calls.jsonl"))
 
@@ -323,6 +331,7 @@ def test_plain_codex_operational_failure_retries_once(
     monkeypatch.setattr(claude, "_call_claude_transport", fail)
     monkeypatch.setattr(claude, "_call_openrouter_transport", fail)
     monkeypatch.setattr(claude, "_call_codex_transport", codex)
+    monkeypatch.setattr(claude, "_backends_for_purpose", lambda _purpose: ("codex",))
     monkeypatch.setattr(claude.time, "sleep", _no_sleep)
     monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(tmp_path / "llm_calls.jsonl"))
 

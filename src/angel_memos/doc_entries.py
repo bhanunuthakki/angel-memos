@@ -27,8 +27,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from angel_memos.claude import Purpose, extract_structured
 from angel_memos.deck import parse_deck_content
+from angel_memos.llm import Purpose, extract_structured
 from angel_memos.materials import Materials, read_text
 from angel_memos.models import (
     AngelListMetadata,
