@@ -11,8 +11,8 @@ decide whether to iterate on `decision.md` before committing the memo.
 
 from pathlib import Path
 
-from angel_memos.claude import Purpose, call_llm
 from angel_memos.deck import parse_deck_content
+from angel_memos.llm import Purpose, call_llm
 from angel_memos.materials import Materials, load_materials, read_text
 from angel_memos.models import AngelListMetadata, Decision, DeckContent
 

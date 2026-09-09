@@ -182,7 +182,7 @@ def load_or_parse_angellist(folder: Path, materials: Materials) -> AngelListMeta
     newer one OR when a deck appears that wasn't present at parse time (the AL
     parse reads the deck too, and founders are extracted from it) — so a later
     deck capture no longer serves stale, founder-less metadata forever."""
-    # Imported lazily — angellist.py depends on claude_cli which is heavy
+    # Imported lazily because the memo parser depends on the heavier LLM boundary.
     # to import for callers that only need text-loading helpers.
     from angel_memos.angellist import parse_angellist_metadata
 

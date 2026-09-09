@@ -22,7 +22,7 @@ import tempfile
 from html import escape
 from pathlib import Path
 
-from angel_memos.claude import Purpose, extract_structured
+from angel_memos.llm import Purpose, extract_structured
 from angel_memos.materials import (
     Materials,
     load_materials,

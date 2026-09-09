@@ -45,7 +45,7 @@ from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from angel_memos.claude import Purpose, extract_structured
+from angel_memos.llm import Purpose, extract_structured
 from angel_memos.models import AngelListMetadata, Stage
 from angel_memos.pdf_utils import rasterize_pdf, read_pdf_text
 

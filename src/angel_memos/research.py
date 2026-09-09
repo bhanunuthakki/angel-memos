@@ -31,7 +31,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from angel_memos.claude import Purpose, extract_structured
+from angel_memos.llm import Purpose, extract_structured
 from angel_memos.models import Stage
 
 PedigreeTier = Literal["S", "A", "B", "C", "D"]

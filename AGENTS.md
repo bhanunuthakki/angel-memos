@@ -62,12 +62,12 @@ Interactive research follows the runtime's `agent-operations` procedure and the 
 writer boundary above.
 
 Application LLM calls remain separate from interactive agent routing. They use
-the runtime's membership transport contract and
-enter once through `src/angel_memos/claude.py`; downstream code never imports
-`anthropic` or `claude_agent_sdk`. Select exact application models by named
+the shared fleet route and enter once through `src/angel_memos/llm.py`; downstream
+code never imports a provider SDK or transport adapter. Select exact application models by named
 purpose behind that entry point and change a stability pin only with an eval
 showing parity or improvement. Do not encode a transient model roster in this
-file.
+file. Judge purposes use their separately registered route through the same
+shared policy rather than inheriting the ordinary application default.
 
 ## Research evidence and privacy
 
