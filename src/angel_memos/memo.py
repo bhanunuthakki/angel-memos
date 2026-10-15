@@ -527,6 +527,7 @@ def _generate_long_memo(
             memo_md = call_llm(
                 prompt,
                 purpose=Purpose.LONG_MEMO,
+                system_prompt=_MEMO_SYSTEM_PROMPT,
                 image_paths=al_pngs + deck_pngs,
             )
             missing = _validate_long_memo(memo_md, decision=decision)
