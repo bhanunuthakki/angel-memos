@@ -39,7 +39,7 @@ from urllib.parse import unquote
 from pydantic import BaseModel, ConfigDict
 
 from angel_memos.config import Config, load_config
-from angel_memos.llm import _subscription_backends
+from angel_memos.llm import subscription_backends
 from angel_memos.materials import MaterialsError, load_materials
 
 # ---------------------------------------------------------------------------
@@ -308,7 +308,7 @@ def decide_launch_command(company: str) -> list[str]:
     On Windows this opens a new console window (`start`) so the chat is
     interactive and visible. The seed prompt triggers the angel-decide skill
     for the deal; the user drives the Q&A from there."""
-    backend = _subscription_backends()[0]
+    backend = subscription_backends()[0]
     executable = {"codex": "codex", "claude": "claude"}.get(backend)
     if executable is None:
         raise RuntimeError(f"No interactive agent adapter is registered for backend {backend!r}")

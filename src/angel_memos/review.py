@@ -84,6 +84,7 @@ def run_decision_review(folder: Path) -> Path:
     review_md = call_llm(
         prompt,
         purpose=Purpose.DECISION_REVIEW,
+        system_prompt=_REVIEW_SYSTEM_PROMPT,
         timeout_seconds=600,
     )
 

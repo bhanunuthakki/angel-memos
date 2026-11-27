@@ -1,4 +1,4 @@
-"""Governed application-LLM routing and ledger behavior."""
+"""Governed application-LLM routing, Gemini-first dispatch, and ledger behavior."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
-from angel_memos import claude
+from angel_memos import llm
 
 
 class _StructuredAnswer(BaseModel):
@@ -17,82 +17,72 @@ class _StructuredAnswer(BaseModel):
     score: int = Field(ge=0, le=100)
 
 
-def _no_sleep(_seconds: float) -> None:
-    return None
-
-
-def test_call_llm_follows_fleet_route_after_backend_failure(
+def test_call_llm_follows_fleet_route_gemini_then_claude(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     calls: list[str] = []
 
-    def fail_claude(*_args: object, **_kwargs: object) -> claude.TransportResult:
+    def fail_gemini(*_args: object, **_kwargs: object) -> llm.TransportResult:
+        calls.append("gemini")
+        raise RuntimeError("transient api error")
+
+    def succeed_claude(*_args: object, **_kwargs: object) -> llm.TransportResult:
         calls.append("claude")
-        raise RuntimeError("subscription unavailable")
+        return llm.TransportResult(text="fallback answer", input_tokens=11, output_tokens=3)
 
-    def succeed_codex(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        calls.append("codex")
-        return claude.TransportResult(
-            text="fallback answer",
-            input_tokens=11,
-            output_tokens=3,
-        )
-
-    monkeypatch.setattr(claude, "_call_claude_transport", fail_claude)
-    monkeypatch.setattr(claude, "_call_codex_transport", succeed_codex)
-    monkeypatch.setattr(claude, "_subscription_backends", lambda: ("claude", "codex"))
+    monkeypatch.setattr(llm, "_call_gemini_transport", fail_gemini)
+    monkeypatch.setattr(llm, "_call_claude_transport", succeed_claude)
+    monkeypatch.setattr(llm, "_fleet_provider_order", lambda: ("gemini", "claude"))
     monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(tmp_path / "llm_calls.jsonl"))
 
-    result = claude.call_llm("private prompt", purpose=claude.Purpose.DILIGENCE_TOPICS)
+    result = llm.call_llm("private prompt", purpose=llm.Purpose.DILIGENCE_TOPICS)
 
     assert result == "fallback answer"
-    assert calls == ["claude", "codex"]
+    assert calls == ["gemini", "claude"]
 
 
-def test_judge_purposes_use_the_explicit_shared_route(
+def test_judge_purposes_use_explicit_judge_route_separate_from_application_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[bool] = []
+    monkeypatch.setattr(llm, "_fleet_provider_order", lambda: ("claude",))
 
-    def route(*, judge: bool = False) -> tuple[str, ...]:
-        calls.append(judge)
-        return ("claude", "codex")
-
-    monkeypatch.setattr(claude, "_subscription_backends", route)
-
-    assert claude._backends_for_purpose(claude.Purpose.SCORE_MARKET) == (
-        "claude",
-        "codex",
-    )
-    assert calls == [True]
+    assert llm._backends_for_purpose(llm.Purpose.SCORE_MARKET) == llm.JUDGE_ROUTE
+    assert llm._backends_for_purpose(llm.Purpose.DILIGENCE_TOPICS) == ("claude",)
 
 
-def test_call_llm_ledger_hashes_private_text(
+def test_call_llm_ledger_hashes_private_text_and_records_gemini_usage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     private_prompt = "private company details"
     private_response = "private investment analysis"
 
-    def succeed(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        return claude.TransportResult(
+    def succeed(*_args: object, **_kwargs: object) -> llm.TransportResult:
+        return llm.TransportResult(
             text=private_response,
-            input_tokens=9,
-            output_tokens=4,
+            input_tokens=1000,
+            cached_input_tokens=200,
+            output_tokens=100,
+            reasoning_output_tokens=50,
         )
 
-    monkeypatch.setattr(claude, "_call_claude_transport", succeed)
-    monkeypatch.setattr(claude, "_subscription_backends", lambda: ("claude",))
+    monkeypatch.setattr(llm, "_call_gemini_transport", succeed)
+    monkeypatch.setattr(llm, "_fleet_provider_order", lambda: ("gemini",))
     ledger_path = tmp_path / "llm_calls.jsonl"
     monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(ledger_path))
 
-    claude.call_llm(private_prompt, purpose=claude.Purpose.DILIGENCE_TOPICS)
+    llm.call_llm(private_prompt, purpose=llm.Purpose.DILIGENCE_TOPICS)
 
     line = ledger_path.read_text(encoding="utf-8").strip()
     entry = json.loads(line)
     assert private_prompt not in line
     assert private_response not in line
+    assert entry["provider"] == "google"
+    assert entry["transport"] == "metered_api"
+    assert entry["model"] == llm.GEMINI_DRIVER_MODEL
+    assert entry["cached_input_tokens"] == 200
+    assert entry["reasoning_output_tokens"] == 50
     assert len(entry["prompt_sha256"]) == 64
     assert len(entry["response_sha256"]) == 64
 
@@ -102,26 +92,52 @@ def test_extract_structured_repairs_once_before_advancing_provider(
     tmp_path: Path,
 ) -> None:
     calls: list[str] = []
-    codex_replies = iter(['{"score": 150}', '{"score": 82}'])
+    gemini_replies = iter(['{"score": 150}', '{"score": 82}'])
 
-    def codex(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        calls.append("codex")
-        return claude.TransportResult(
-            text=next(codex_replies), input_tokens=10, output_tokens=3
-        )
+    def gemini(*_args: object, **_kwargs: object) -> llm.TransportResult:
+        calls.append("gemini")
+        return llm.TransportResult(text=next(gemini_replies), input_tokens=10, output_tokens=3)
 
-    monkeypatch.setattr(claude, "_call_codex_transport", codex)
-    monkeypatch.setattr(claude, "_subscription_backends", lambda: ("codex",))
+    monkeypatch.setattr(llm, "_call_gemini_transport", gemini)
+    monkeypatch.setattr(llm, "_fleet_provider_order", lambda: ("gemini", "claude"))
     monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(tmp_path / "llm_calls.jsonl"))
 
-    result = claude.extract_structured(
+    result = llm.extract_structured(
         "score this deal",
         _StructuredAnswer,
-        purpose=claude.Purpose.DILIGENCE_TOPICS,
+        purpose=llm.Purpose.DILIGENCE_TOPICS,
     )
 
     assert result.score == 82
-    assert calls == ["codex", "codex"]
+    assert calls == ["gemini", "gemini"]
+
+
+def test_extract_structured_falls_back_to_claude_after_gemini_operational_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def fail_gemini(*_args: object, **_kwargs: object) -> llm.TransportResult:
+        calls.append("gemini")
+        raise RuntimeError("gemini 503")
+
+    def succeed_claude(*_args: object, **_kwargs: object) -> llm.TransportResult:
+        calls.append("claude")
+        return llm.TransportResult(text='{"score": 77}', input_tokens=10, output_tokens=3)
+
+    monkeypatch.setattr(llm, "_call_gemini_transport", fail_gemini)
+    monkeypatch.setattr(llm, "_call_claude_structured_transport", succeed_claude)
+    monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(tmp_path / "llm_calls.jsonl"))
+
+    result = llm.extract_structured(
+        "score this deal",
+        _StructuredAnswer,
+        purpose=llm.Purpose.SCORE_MARKET,
+    )
+
+    assert result.score == 77
+    assert calls == ["gemini", "claude"]
 
 
 def test_application_call_sites_use_only_the_governed_entry_point() -> None:
@@ -134,52 +150,44 @@ def test_application_call_sites_use_only_the_governed_entry_point() -> None:
         and (
             "angel_memos.claude_cli" in path.read_text(encoding="utf-8")
             or "call_claude(" in path.read_text(encoding="utf-8")
+            or "from google import genai" in path.read_text(encoding="utf-8")
         )
     ]
 
     assert violations == []
 
 
-def test_v2_scoring_purposes_have_governed_routes() -> None:
-    expected = {
-        claude.Purpose.SCORE_ARCHETYPE,
-        claude.Purpose.SCORE_TEAM_FIT,
-        claude.Purpose.SCORE_COMMERCIAL_EVIDENCE,
-        claude.Purpose.SCORE_DEFENSIBILITY,
-        claude.Purpose.SCORE_EXECUTION_CAPITAL,
-    }
-
-    assert expected <= set(claude.MODEL_ROUTES)
+def test_every_purpose_has_a_governed_route() -> None:
+    assert set(llm.Purpose) == set(llm.MODEL_ROUTES)
 
 
-def test_codex_image_args_preserve_stdin_prompt_and_attach_every_image() -> None:
-    base = ["codex", "exec", "--json", "-"]
-    images = [Path("page-1.png"), Path("page-2.png")]
+def test_strip_at_image_refs_removes_claude_file_markers_only() -> None:
+    prompt = "@/tmp/deck/page_001.png\n@/tmp/deck/page_002.PNG\n\nExtract founder names.\nEmail: founder@acme.com"
 
-    args = claude._with_codex_images(base, images)
+    cleaned = llm._strip_at_image_refs(prompt)
 
-    assert args[-1] == "-"
-    assert args.count("--image") == 2
-    assert "page-1.png" in args
-    assert "page-2.png" in args
+    assert "/tmp/deck/page_001.png" not in cleaned
+    assert "Extract founder names." in cleaned
+    assert "founder@acme.com" in cleaned
 
 
-def test_codex_paths_follow_agent_instructions_root_override(
+def test_resolve_gemini_api_key_prefers_env_then_project_then_instructions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    root = tmp_path / "agent-instructions"
-    wrapper = root / "snippets" / "codex_cli.py"
-    wrapper.parent.mkdir(parents=True)
-    wrapper.write_text("def call_codex_with_usage(): pass\n", encoding="utf-8")
-    executable = root / ".tools" / "node_modules" / ".bin" / "codex"
-    executable.parent.mkdir(parents=True)
-    executable.write_text("", encoding="utf-8")
-    monkeypatch.setenv(claude.AGENT_INSTRUCTIONS_ROOT_ENV_VAR, str(root))
+    instructions = tmp_path / "agent-instructions"
+    (instructions / "snippets").mkdir(parents=True)
+    (instructions / "snippets" / "llm_policy.py").write_text("", encoding="utf-8")
+    (instructions / ".env").write_text("GEMINI_API_KEY=from-file\n", encoding="utf-8")
 
-    assert claude._agent_instructions_root() == root
-    assert claude._codex_cli_path(root) == executable
-    assert claude._codex_membership_home(root) == root / ".codex-membership"
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv(llm.AGENT_INSTRUCTIONS_ROOT_ENV_VAR, str(instructions))
+
+    assert llm._resolve_gemini_api_key() == "from-file"
+
+    monkeypatch.setenv("GEMINI_API_KEY", "from-env")
+    assert llm._resolve_gemini_api_key() == "from-env"
 
 
 def test_agent_instructions_root_finds_sibling_checkout(
@@ -187,158 +195,12 @@ def test_agent_instructions_root_finds_sibling_checkout(
     tmp_path: Path,
 ) -> None:
     applications = tmp_path / "Applications"
-    module_path = applications / "angel-memos" / "src" / "angel_memos" / "claude.py"
+    module_path = applications / "angel-memos" / "src" / "angel_memos" / "llm.py"
     root = applications / "agent-instructions"
-    wrapper = root / "snippets" / "codex_cli.py"
-    wrapper.parent.mkdir(parents=True)
-    wrapper.write_text("def call_codex_with_usage(): pass\n", encoding="utf-8")
-    monkeypatch.delenv(claude.AGENT_INSTRUCTIONS_ROOT_ENV_VAR, raising=False)
-    monkeypatch.setenv("AGENT_INSTRUCTIONS_DIR", str(tmp_path / "missing"))
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(claude, "__file__", str(module_path))
+    policy = root / "snippets" / "llm_policy.py"
+    policy.parent.mkdir(parents=True)
+    policy.write_text("", encoding="utf-8")
+    monkeypatch.delenv(llm.AGENT_INSTRUCTIONS_ROOT_ENV_VAR, raising=False)
+    monkeypatch.setattr(llm, "__file__", str(module_path))
 
-    assert claude._agent_instructions_root() == root
-
-
-def test_codex_membership_accepts_success_marker_after_warning(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    cli_path = tmp_path / "codex"
-    cli_path.write_text("", encoding="utf-8")
-
-    def fake_run(*_args: object, **_kwargs: object) -> claude.subprocess.CompletedProcess[str]:
-        return claude.subprocess.CompletedProcess(
-            args=[str(cli_path), "login", "status"],
-            returncode=0,
-            stdout="",
-            stderr="WARNING: benign setup notice\nLogged in using ChatGPT\n",
-        )
-
-    monkeypatch.setattr(
-        claude.subprocess,
-        "run",
-        fake_run,
-    )
-
-    claude._verify_codex_membership(cli_path, {})
-
-
-def test_codex_web_required_call_uses_isolated_live_search(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[list[Path], bool]] = []
-
-    def direct(
-        _prompt: str,
-        *,
-        model: str,
-        timeout_seconds: int,
-        image_paths: list[Path],
-        enable_web: bool,
-    ) -> claude._CodexResultValue:
-        del model, timeout_seconds
-        calls.append((image_paths, enable_web))
-        return claude._CodexResultValue(
-            text="sourced answer",
-            usage=claude._CodexUsageValue(
-                input_tokens=12,
-                cached_input_tokens=0,
-                output_tokens=4,
-                reasoning_output_tokens=1,
-            ),
-        )
-
-    monkeypatch.setattr(claude, "_call_codex_direct", direct)
-
-    result = claude._call_codex_transport(
-        "research the founder",
-        model="gpt-5.6-terra",
-        timeout_seconds=60,
-        image_paths=[],
-        requires_web=True,
-    )
-
-    assert result.text == "sourced answer"
-    assert calls == [([], True)]
-
-
-def test_codex_direct_args_enable_only_web_search_not_shell_network() -> None:
-    args = claude._build_codex_argv(
-        Path("codex.cmd"),
-        model="gpt-5.6-terra",
-        working_directory=Path("isolated"),
-        enable_web=True,
-    )
-
-    assert 'web_search="live"' in args
-    assert "shell_tool" in args
-    assert "apps" in args
-    assert "remote_plugin" in args
-    assert "danger-full-access" not in args
-
-
-def test_structured_codex_operational_failure_retries_once(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    calls: list[str] = []
-
-    def fail_primary(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        raise RuntimeError("primary unavailable")
-
-    def fail_openrouter(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        raise RuntimeError("openrouter unavailable")
-
-    def codex(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        calls.append("codex")
-        if len(calls) == 1:
-            raise RuntimeError("transient membership failure")
-        return claude.TransportResult(text='{"score": 77}', input_tokens=10, output_tokens=3)
-
-    monkeypatch.setattr(claude, "_call_claude_structured_transport", fail_primary)
-    monkeypatch.setattr(claude, "_call_openrouter_transport", fail_openrouter)
-    monkeypatch.setattr(claude, "_call_codex_transport", codex)
-    monkeypatch.setattr(claude, "_backends_for_purpose", lambda _purpose: ("codex",))
-    monkeypatch.setattr(claude.time, "sleep", _no_sleep)
-    monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(tmp_path / "llm_calls.jsonl"))
-
-    result = claude.extract_structured(
-        "score this deal",
-        _StructuredAnswer,
-        purpose=claude.Purpose.SCORE_MARKET,
-    )
-
-    assert result.score == 77
-    assert calls == ["codex", "codex"]
-
-
-def test_plain_codex_operational_failure_retries_once(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    calls: list[str] = []
-
-    def fail(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        raise RuntimeError("provider unavailable")
-
-    def codex(*_args: object, **_kwargs: object) -> claude.TransportResult:
-        calls.append("codex")
-        if len(calls) == 1:
-            raise RuntimeError("transient membership failure")
-        return claude.TransportResult(text="recovered", input_tokens=8, output_tokens=2)
-
-    monkeypatch.setattr(claude, "_call_claude_transport", fail)
-    monkeypatch.setattr(claude, "_call_openrouter_transport", fail)
-    monkeypatch.setattr(claude, "_call_codex_transport", codex)
-    monkeypatch.setattr(claude, "_backends_for_purpose", lambda _purpose: ("codex",))
-    monkeypatch.setattr(claude.time, "sleep", _no_sleep)
-    monkeypatch.setenv("ANGEL_MEMOS_LLM_LEDGER", str(tmp_path / "llm_calls.jsonl"))
-
-    result = claude.call_llm(
-        "write a diligence memo",
-        purpose=claude.Purpose.DILIGENCE_TOPICS,
-    )
-
-    assert result == "recovered"
-    assert calls == ["codex", "codex"]
+    assert llm._agent_instructions_root() == root

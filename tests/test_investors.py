@@ -5,7 +5,6 @@ web-research grading call is injected as a plain callable."""
 from datetime import date
 from pathlib import Path
 
-from angel_memos.claude import LlmCallError
 from angel_memos.config import Config
 from angel_memos.investors import (
     STALE_AFTER_DAYS,
@@ -23,6 +22,7 @@ from angel_memos.investors import (
     render_investors_markdown,
     upsert_record,
 )
+from angel_memos.llm import LlmCallError
 from angel_memos.models import AngelListMetadata, Stage
 
 

@@ -1,39 +1,57 @@
 """Governed, provider-neutral application-LLM entry point.
 
-All application calls select a model by purpose and resolve subscription
-backend order through the shared fleet policy. Private prompts and responses
-are represented in the ledger only by hashes.
+Synced with earnings-summary's Gemini-first + Claude-fallback architecture and
+governed by agent-instructions' fleet routing policy (`preferred_provider_order`
+and `subscription_route`). Private prompts and responses are represented in the
+ledger only by SHA-256 hashes.
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import importlib.util
 import json
+import logging
 import os
-import subprocess
+import re
 import sys
-import tempfile
 import time
-import urllib.error
-import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from angel_memos.claude_cli import call_claude
 from angel_memos.claude_cli import extract_structured as extract_claude_structured
+from angel_memos.log_redact import redact
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 600
-_CODEX_RETRY_DELAY_SECONDS = 5
-_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 AGENT_INSTRUCTIONS_ROOT_ENV_VAR = "AGENT_INSTRUCTIONS_HOME"
+
+# Inline base64 requests on Gemini Interactions cap at 20 MB total payload.
+# Keep a generous margin for prompt text and base64 (~33%) overhead; larger
+# decks upload via Files API and are deleted immediately in `finally`.
+_MAX_INLINE_IMAGE_BYTES = 12 * 1024 * 1024
+
+_AT_IMAGE_REF_LINE_RE = re.compile(r"^\s*@.+\.(?:png|jpe?g|webp)\s*$", re.IGNORECASE)
+_AUTH_ERROR_MARKERS = (
+    "API_KEY_INVALID",
+    "API key not valid",
+    "PERMISSION_DENIED",
+    "UNAUTHENTICATED",
+)
+
+GEMINI_WORKHORSE_MODEL = "gemini-4-hydrogen"
+GEMINI_DRIVER_MODEL = "gemini-4-neon"
+CLAUDE_FALLBACK_MODEL = "claude-opus-4-7"
 
 
 class Purpose(StrEnum):
@@ -71,14 +89,16 @@ JUDGE_PURPOSES = frozenset(
         Purpose.SCORE_CRITIQUE,
     }
 )
-JUDGE_SUBSCRIPTION_ROUTE = ("claude", "codex")
+
+# Explicit, separately registered route for advisory scoring judge purposes
+# (distinct from ordinary application routing; registered in llm_usage_index.json).
+JUDGE_ROUTE: tuple[str, ...] = ("gemini", "claude")
 
 
 @dataclass(frozen=True)
 class ModelRoute:
+    gemini_model: str
     claude_model: str
-    openrouter_model: str
-    codex_model: str
     rationale: str
     requires_web: bool = False
 
@@ -94,142 +114,130 @@ class TransportResult:
 
 MODEL_ROUTES: dict[Purpose, ModelRoute] = {
     Purpose.ANGELLIST_TERMS: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Vision-heavy structured terms extraction; preserve incumbent.",
+        GEMINI_WORKHORSE_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Multimodal structured terms extraction via fleet workhorse.",
     ),
     Purpose.ANGELLIST_FOUNDERS: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Name extraction needs strong vision and instruction following.",
+        GEMINI_WORKHORSE_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Founder name extraction via fleet workhorse.",
     ),
     Purpose.DECK_EXTRACTION: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Long multimodal extraction remains on the validated incumbent.",
+        GEMINI_WORKHORSE_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Multi-slide pitch deck extraction via fleet multimodal workhorse.",
     ),
     Purpose.DILIGENCE_TOPICS: ModelRoute(
-        claude_model="claude-opus-4-7",
-        openrouter_model="openai/gpt-5.6-terra",
-        codex_model="gpt-5.6-terra",
-        rationale="Preserve the incumbent judgment tier; use balanced cross-provider fallbacks.",
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Adversarial diligence synthesis uses the fleet driver tier.",
     ),
     Purpose.FOUNDER_PROFILE: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Current founder research requires grounded web evidence.",
+        GEMINI_WORKHORSE_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Current founder research requires live web grounding.",
         requires_web=True,
     ),
     Purpose.COMPARABLE_DEALS: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Current private-market comparable research requires web evidence.",
+        GEMINI_WORKHORSE_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Current private-market comparable research requires live web grounding.",
         requires_web=True,
     ),
     Purpose.INVESTOR_GRADE: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Investor grading requires current sourced research.",
+        GEMINI_WORKHORSE_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Investor grading requires current sourced web research.",
         requires_web=True,
     ),
     Purpose.RECENT_EVENTS: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Event discovery (exec quotes, competitor M&A, insourcing) requires live web search.",
+        GEMINI_WORKHORSE_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Recent-event discovery requires live web grounding.",
         requires_web=True,
     ),
-    Purpose.SCORE_MARKET: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Schema-bound market judgment needs balanced reasoning.",
-    ),
     Purpose.SCORE_ARCHETYPE: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Closed-schema archetype selection chooses evidence anchors without scoring.",
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Closed-schema archetype selection on explicit advisory judge route.",
     ),
     Purpose.SCORE_TEAM_FIT: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Founder-market-fit judgment is separated from deterministic pedigree.",
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Founder-market-fit advisory judge separated from deterministic pedigree.",
+    ),
+    Purpose.SCORE_MARKET: ModelRoute(
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Schema-bound market advisory judgment.",
     ),
     Purpose.SCORE_TRACTION_TECH: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Schema-bound traction and technology judgment needs balanced reasoning.",
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Schema-bound traction and technology advisory judgment.",
     ),
     Purpose.SCORE_COMMERCIAL_EVIDENCE: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Schema-bound commercial evidence judgment includes claim reconciliation.",
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Schema-bound commercial evidence advisory judgment.",
     ),
     Purpose.SCORE_DEFENSIBILITY: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Schema-bound moat judgment uses archetype-specific evidence anchors.",
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Schema-bound moat advisory judgment.",
     ),
     Purpose.SCORE_EXECUTION_CAPITAL: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Schema-bound execution and capital-scaling judgment.",
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Schema-bound execution and capital-scaling advisory judgment.",
     ),
     Purpose.SCORE_CRITIQUE: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Narrow adversarial score review is schema constrained.",
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Narrow adversarial score critique.",
     ),
     Purpose.PRIVATE_DOC_ENTRY: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Style-bound structured investment summary.",
+        GEMINI_WORKHORSE_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Style-bound structured private investment summary.",
     ),
     Purpose.PUBLIC_DOC_ENTRY: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-terra",
-        "gpt-5.6-terra",
-        "Privacy-sensitive masked memo generation needs strong instruction following.",
+        GEMINI_WORKHORSE_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Privacy-sensitive masked public summary.",
     ),
     Purpose.LONG_MEMO: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-sol",
-        "gpt-5.6-sol",
-        "Long-form investment synthesis is judgment heavy.",
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Long-form investment synthesis uses the fleet driver tier.",
     ),
     Purpose.DECISION_REVIEW: ModelRoute(
-        "claude-opus-4-7",
-        "openai/gpt-5.6-sol",
-        "gpt-5.6-sol",
-        "Adversarial investment review is judgment heavy.",
+        GEMINI_DRIVER_MODEL,
+        CLAUDE_FALLBACK_MODEL,
+        "Adversarial decision pressure-test uses the fleet driver tier.",
     ),
 }
 
+# Public API list prices ($/MTok input, output) verified against
+# agent-instructions/procedures/model-frontier.REFERENCE.md (2026-11-25).
 _PUBLIC_PRICES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
-    "claude-opus-4-7": (5.0, 25.0),
-    "openai/gpt-5.6-terra": (2.5, 15.0),
-    "gpt-5.6-terra": (2.5, 15.0),
-    "openai/gpt-5.6-sol": (5.0, 30.0),
-    "gpt-5.6-sol": (5.0, 30.0),
+    "gemini-4-hydrogen": (1.50, 7.50),
+    "gemini-4-neon": (3.00, 15.00),
+    "gemini-4-carbon": (2.00, 10.00),
+    "gemini-4-argon": (2.00, 10.00),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
+    "claude-opus-4-7": (5.00, 25.00),
+    "claude-opus-4-8": (5.00, 25.00),
 }
 
 
 class LlmCallError(RuntimeError):
     """All configured transports failed without exposing private payloads."""
+
+
+class GeminiSetupError(RuntimeError):
+    """Gemini Developer API credentials are missing or rejected."""
 
 
 class _LedgerEntry(BaseModel):
@@ -254,94 +262,6 @@ class _LedgerEntry(BaseModel):
     response_sha256: str | None = None
 
 
-class _OpenRouterMessage(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    content: str
-
-
-class _OpenRouterChoice(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    message: _OpenRouterMessage
-
-
-class _OpenRouterUsage(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    prompt_tokens: int = Field(default=0, ge=0)
-    completion_tokens: int = Field(default=0, ge=0)
-
-
-class _OpenRouterResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    choices: list[_OpenRouterChoice] = Field(min_length=1)
-    usage: _OpenRouterUsage = Field(default_factory=_OpenRouterUsage)
-
-
-class _CodexUsage(Protocol):
-    @property
-    def input_tokens(self) -> int: ...
-
-    @property
-    def cached_input_tokens(self) -> int: ...
-
-    @property
-    def output_tokens(self) -> int: ...
-
-    @property
-    def reasoning_output_tokens(self) -> int: ...
-
-
-class _CodexResult(Protocol):
-    @property
-    def text(self) -> str: ...
-
-    @property
-    def usage(self) -> _CodexUsage: ...
-
-
-class _CodexUsageValue(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    input_tokens: int = Field(ge=0)
-    cached_input_tokens: int = Field(ge=0)
-    output_tokens: int = Field(ge=0)
-    reasoning_output_tokens: int = Field(ge=0)
-
-
-class _CodexItemValue(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    type: str
-    text: str | None = None
-
-
-class _CodexEventValue(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    type: str
-    item: _CodexItemValue | None = None
-    usage: _CodexUsageValue | None = None
-
-
-@dataclass(frozen=True)
-class _CodexResultValue:
-    text: str
-    usage: _CodexUsageValue
-
-
-class _CodexModule(Protocol):
-    def call_codex_with_usage(
-        self,
-        prompt: str,
-        *,
-        model: str,
-        timeout_seconds: int,
-    ) -> _CodexResult: ...
-
-
 def call_llm(
     prompt: str,
     *,
@@ -360,39 +280,48 @@ def call_llm(
     run_id = str(uuid.uuid4())
     images = image_paths or []
     full_prompt = _combine_prompts(system_prompt, prompt)
-    backend_attempts = {
+
+    def call_gemini_plain(
+        _combined: str,
+        *,
+        model: str,
+        timeout_seconds: int,
+        image_paths: list[Path],
+        requires_web: bool,
+    ) -> TransportResult:
+        del _combined
+        return _call_gemini_transport(
+            prompt,
+            system_prompt=system_prompt,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            image_paths=image_paths,
+            requires_web=requires_web,
+        )
+
+    backend_attempts: dict[str, tuple[str, str, str, Callable[..., TransportResult]]] = {
+        "gemini": (
+            "google",
+            "metered_api",
+            route.gemini_model,
+            call_gemini_plain,
+        ),
         "claude": (
             "anthropic",
             "subscription_cli",
             route.claude_model,
             _call_claude_transport,
         ),
-        "codex": (
-            "openai",
-            "subscription_cli",
-            route.codex_model,
-            _call_codex_transport,
-        ),
     }
-    attempts: list[
-        tuple[str, str, str, Callable[..., TransportResult], int]
-    ] = []
+    attempts: list[tuple[str, str, str, Callable[..., TransportResult]]] = []
     for backend in _backends_for_purpose(purpose):
         try:
-            provider, transport, model, caller = backend_attempts[backend]
+            attempts.append(backend_attempts[backend])
         except KeyError:
-            raise LlmCallError(f"unsupported fleet subscription backend: {backend}") from None
-        attempts.append((provider, transport, model, caller, 0))
-        if backend == "codex":
-            attempts.append(
-                (provider, transport, model, caller, _CODEX_RETRY_DELAY_SECONDS)
-            )
+            raise LlmCallError(f"unsupported fleet backend: {backend}") from None
+
     failures: list[str] = []
-    for attempt_number, (provider, transport, model, caller, delay_seconds) in enumerate(
-        attempts, start=1
-    ):
-        if delay_seconds:
-            time.sleep(delay_seconds)
+    for attempt_number, (provider, transport, model, caller) in enumerate(attempts, start=1):
         started = time.perf_counter()
         try:
             result = caller(
@@ -405,6 +334,13 @@ def call_llm(
         except Exception as exc:
             elapsed_ms = round((time.perf_counter() - started) * 1000)
             failures.append(type(exc).__name__)
+            logger.warning(
+                "llm call failed: purpose=%s provider=%s model=%s error=%s",
+                purpose.value,
+                provider,
+                model,
+                redact(f"{type(exc).__name__}: {str(exc)[:300]}"),
+            )
             _append_ledger(
                 _ledger_entry(
                     run_id=run_id,
@@ -462,7 +398,23 @@ def extract_structured[T: BaseModel](
     failures: list[str] = []
     attempt_number = 0
 
-    def call_primary(current_prompt: str) -> TransportResult:
+    def call_gemini(current_prompt: str) -> TransportResult:
+        schema = json.dumps(model_type.model_json_schema(), indent=2)
+        request = (
+            f"{current_prompt}\n\n"
+            "Return ONLY one valid JSON object matching this schema — no markdown "
+            f"code fences and no surrounding prose:\n{schema}"
+        )
+        return _call_gemini_transport(
+            request,
+            system_prompt=system_prompt,
+            model=route.gemini_model,
+            timeout_seconds=timeout_seconds,
+            image_paths=images,
+            requires_web=route.requires_web,
+        )
+
+    def call_claude_structured(current_prompt: str) -> TransportResult:
         return _call_claude_structured_transport(
             current_prompt,
             model_type=model_type,
@@ -473,39 +425,25 @@ def extract_structured[T: BaseModel](
             image_paths=images,
         )
 
-    def call_codex(current_prompt: str) -> TransportResult:
-        return _call_codex_transport(
-            _structured_prompt(current_prompt, model_type, system_prompt),
-            model=route.codex_model,
-            timeout_seconds=timeout_seconds,
-            image_paths=images,
-            requires_web=route.requires_web,
-        )
-
-    backend_providers: dict[
-        str, tuple[str, str, str, Callable[[str], TransportResult]]
-    ] = {
+    backend_providers: dict[str, tuple[str, str, str, Callable[[str], TransportResult]]] = {
+        "gemini": (
+            "google",
+            "metered_api",
+            route.gemini_model,
+            call_gemini,
+        ),
         "claude": (
             "anthropic",
             "subscription_cli",
             route.claude_model,
-            call_primary,
-        ),
-        "codex": (
-            "openai",
-            "subscription_cli",
-            route.codex_model,
-            call_codex,
+            call_claude_structured,
         ),
     }
     try:
-        providers = tuple(
-            backend_providers[backend] for backend in _backends_for_purpose(purpose)
-        )
+        providers = tuple(backend_providers[backend] for backend in _backends_for_purpose(purpose))
     except KeyError as exc:
-        raise LlmCallError(
-            f"unsupported fleet subscription backend: {exc.args[0]}"
-        ) from None
+        raise LlmCallError(f"unsupported fleet backend: {exc.args[0]}") from None
+
     for provider, transport, model, caller in providers:
         current_prompt = prompt
         for repair_number in range(2):
@@ -539,6 +477,13 @@ def extract_structured[T: BaseModel](
             except Exception as exc:
                 elapsed_ms = round((time.perf_counter() - started) * 1000)
                 failures.append(type(exc).__name__)
+                logger.warning(
+                    "structured llm call failed: purpose=%s provider=%s model=%s error=%s",
+                    purpose.value,
+                    provider,
+                    model,
+                    redact(f"{type(exc).__name__}: {str(exc)[:300]}"),
+                )
                 _append_ledger(
                     _ledger_entry(
                         run_id=run_id,
@@ -553,13 +498,6 @@ def extract_structured[T: BaseModel](
                         error_type=type(exc).__name__,
                     )
                 )
-                if (
-                    provider == "openai"
-                    and repair_number == 0
-                    and not isinstance(exc, (ValueError, FileNotFoundError))
-                ):
-                    time.sleep(_CODEX_RETRY_DELAY_SECONDS)
-                    continue
                 break
             elapsed_ms = round((time.perf_counter() - started) * 1000)
             _append_ledger(
@@ -583,6 +521,171 @@ def extract_structured[T: BaseModel](
         f"all configured transports failed structured output for "
         f"purpose={purpose.value}: {failure_summary}"
     ) from None
+
+
+def _resolve_gemini_api_key() -> str:
+    """Resolve GEMINI_API_KEY per machine-operations.md: env -> project .env -> agent-instructions/.env."""
+    for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        val = os.environ.get(env_var, "").strip()
+        if val:
+            return val
+
+    candidate_files: list[Path] = [Path(__file__).resolve().parents[2] / ".env"]
+    with contextlib.suppress(FileNotFoundError):
+        candidate_files.append(_agent_instructions_root() / ".env")
+
+    for env_file in candidate_files:
+        key = _read_env_var(env_file, "GEMINI_API_KEY") or _read_env_var(env_file, "GOOGLE_API_KEY")
+        if key:
+            return key
+
+    raise GeminiSetupError(
+        "GEMINI_API_KEY is not configured in environment, project .env, or agent-instructions/.env."
+    )
+
+
+def _read_env_var(env_file: Path, name: str) -> str:
+    """Read one named variable from a .env file without loading unrelated secrets."""
+    if not env_file.is_file():
+        return ""
+    prefix = f"{name}="
+    try:
+        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if line.startswith(prefix):
+                return line[len(prefix) :].strip().strip("'\"")
+    except OSError:
+        return ""
+    return ""
+
+
+def _strip_at_image_refs(prompt: str) -> str:
+    """Remove Claude-CLI `@/path/to/page.png` lines when images are attached directly."""
+    lines = [line for line in prompt.splitlines() if not _AT_IMAGE_REF_LINE_RE.match(line)]
+    return "\n".join(lines).strip()
+
+
+def _safe_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return max(0, int(value))
+
+
+def _call_gemini_transport(
+    prompt: str,
+    *,
+    system_prompt: str | None,
+    model: str,
+    timeout_seconds: int,
+    image_paths: list[Path],
+    requires_web: bool,
+) -> TransportResult:
+    """Call Gemini Developer API via google-genai Interactions API with store=False."""
+    credential = _resolve_gemini_api_key()
+    from google import genai
+    from google.genai import errors as genai_errors
+    from google.genai import types as genai_types
+
+    for image_path in image_paths:
+        if not image_path.is_file():
+            raise FileNotFoundError(f"Gemini image attachment not found: {image_path}")
+
+    client = genai.Client(
+        api_key=credential,
+        http_options=genai_types.HttpOptions(
+            timeout=timeout_seconds * 1000,
+            retry_options=genai_types.HttpRetryOptions(attempts=2),
+        ),
+    )
+    uploaded_names: list[str] = []
+    try:
+        clean_prompt = _strip_at_image_refs(prompt) if image_paths else prompt
+        if requires_web:
+            clean_prompt = (
+                "Use Google Search only for public-source research needed to answer the "
+                "request. Never put confidential deal terms, private metrics, or other "
+                "non-public material into a search query.\n\n" + clean_prompt
+            )
+
+        interaction_input: str | list[dict[str, object]]
+        if image_paths:
+            total_bytes = sum(p.stat().st_size for p in image_paths)
+            parts: list[dict[str, object]] = [{"type": "text", "text": clean_prompt}]
+            if total_bytes <= _MAX_INLINE_IMAGE_BYTES:
+                for image_path in image_paths:
+                    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+                    parts.append(
+                        {
+                            "type": "image",
+                            "data": encoded,
+                            "mime_type": _image_mime_type(image_path),
+                        }
+                    )
+            else:
+                for image_path in image_paths:
+                    uploaded = client.files.upload(file=str(image_path))
+                    if uploaded.name:
+                        uploaded_names.append(uploaded.name)
+                    parts.append(
+                        {
+                            "type": "image",
+                            "uri": uploaded.uri,
+                            "mime_type": uploaded.mime_type or _image_mime_type(image_path),
+                        }
+                    )
+            interaction_input = parts
+        else:
+            interaction_input = clean_prompt
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "input": interaction_input,
+            "store": False,
+        }
+        if system_prompt:
+            kwargs["system_instruction"] = system_prompt
+        if requires_web:
+            kwargs["tools"] = [{"type": "google_search"}]
+
+        try:
+            interaction = client.interactions.create(**kwargs)
+        except genai_errors.APIError as exc:
+            code = getattr(exc, "code", None)
+            if code in {401, 403} or (
+                code == 400 and any(marker in str(exc) for marker in _AUTH_ERROR_MARKERS)
+            ):
+                raise GeminiSetupError(
+                    f"Gemini API rejected credentials (HTTP {code}): {redact(str(exc)[:200])}"
+                ) from None
+            raise RuntimeError(
+                f"Gemini API error (HTTP {code}): {redact(str(exc)[:200])}"
+            ) from None
+
+        raw_output: object = getattr(interaction, "output_text", None)
+        text = raw_output.strip() if isinstance(raw_output, str) else ""
+        if not text:
+            raise RuntimeError(f"Gemini returned empty output for model {model}")
+
+        usage = getattr(interaction, "usage", None)
+        return TransportResult(
+            text=text,
+            input_tokens=_safe_int(getattr(usage, "total_input_tokens", 0)),
+            cached_input_tokens=_safe_int(getattr(usage, "total_cached_tokens", 0)),
+            output_tokens=_safe_int(getattr(usage, "total_output_tokens", 0)),
+            reasoning_output_tokens=_safe_int(getattr(usage, "total_thought_tokens", 0)),
+        )
+    finally:
+        for file_name in uploaded_names:
+            try:
+                client.files.delete(name=file_name)
+            except Exception as exc:
+                logger.warning("failed to delete temporary Gemini file: %s", redact(str(exc)[:120]))
+        with contextlib.suppress(Exception):
+            client.close()
 
 
 def _call_claude_structured_transport[T: BaseModel](
@@ -621,178 +724,12 @@ def _call_claude_transport(
     requires_web: bool,
 ) -> TransportResult:
     del image_paths, requires_web
-    # Claude resolves @path references already embedded in the prompt. Raw
-    # prose purposes currently do not require WebSearch.
     text = call_claude(prompt, model=model, timeout_seconds=timeout_seconds)
     return TransportResult(
         text=text,
         input_tokens=_estimate_tokens(prompt),
         output_tokens=_estimate_tokens(text),
     )
-
-
-def _call_openrouter_transport(
-    prompt: str,
-    *,
-    model: str,
-    timeout_seconds: int,
-    image_paths: list[Path],
-    requires_web: bool,
-) -> TransportResult:
-    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
-    content: str | list[dict[str, object]]
-    if image_paths:
-        parts: list[dict[str, object]] = [{"type": "text", "text": prompt}]
-        for image_path in image_paths:
-            mime_type = _image_mime_type(image_path)
-            encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-            parts.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
-                }
-            )
-        content = parts
-    else:
-        content = prompt
-    request_body: dict[str, object] = {
-        "model": model,
-        "messages": [{"role": "user", "content": content}],
-    }
-    if requires_web:
-        request_body["tools"] = [{"type": "openrouter:web_search"}]
-    payload = json.dumps(request_body).encode("utf-8")
-    request = urllib.request.Request(
-        _OPENROUTER_URL,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "X-Title": "Angel Memos",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            raw = response.read()
-        parsed = _OpenRouterResponse.model_validate_json(raw)
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"OpenRouter returned HTTP {exc.code}") from None
-    except (urllib.error.URLError, TimeoutError, OSError, ValidationError, ValueError):
-        raise RuntimeError("OpenRouter request failed or returned an invalid response") from None
-    text = parsed.choices[0].message.content.strip()
-    if not text:
-        raise RuntimeError("OpenRouter returned empty content")
-    return TransportResult(
-        text=text,
-        input_tokens=parsed.usage.prompt_tokens,
-        output_tokens=parsed.usage.completion_tokens,
-    )
-
-
-def _call_codex_transport(
-    prompt: str,
-    *,
-    model: str,
-    timeout_seconds: int,
-    image_paths: list[Path],
-    requires_web: bool,
-) -> TransportResult:
-    if requires_web or image_paths:
-        direct_prompt = prompt
-        if requires_web:
-            direct_prompt = (
-                "Use live web search only for public-source research needed to answer "
-                "the request. Never put confidential deal terms, private metrics, or "
-                "other non-public material into a search query.\n\n" + prompt
-            )
-        result = _call_codex_direct(
-            direct_prompt,
-            model=model,
-            timeout_seconds=timeout_seconds,
-            image_paths=image_paths,
-            enable_web=requires_web,
-        )
-    else:
-        module = _load_codex_module()
-        result = module.call_codex_with_usage(
-            prompt,
-            model=model,
-            timeout_seconds=timeout_seconds,
-        )
-    return TransportResult(
-        text=result.text,
-        input_tokens=result.usage.input_tokens,
-        cached_input_tokens=result.usage.cached_input_tokens,
-        output_tokens=result.usage.output_tokens,
-        reasoning_output_tokens=result.usage.reasoning_output_tokens,
-    )
-
-
-def _load_codex_module() -> _CodexModule:
-    module_name = "_angel_memos_codex_cli"
-    existing = sys.modules.get(module_name)
-    if existing is None:
-        path = _agent_instructions_root() / "snippets" / "codex_cli.py"
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("could not load the canonical Codex membership wrapper")
-        loaded = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = loaded
-        spec.loader.exec_module(loaded)
-        existing = loaded
-    if not hasattr(existing, "call_codex_with_usage"):
-        raise RuntimeError("canonical Codex membership wrapper has an invalid interface")
-    return cast("_CodexModule", existing)
-
-
-def _call_codex_direct(
-    prompt: str,
-    *,
-    model: str,
-    timeout_seconds: int,
-    image_paths: list[Path],
-    enable_web: bool,
-) -> _CodexResult:
-    for image_path in image_paths:
-        if not image_path.is_file():
-            raise FileNotFoundError(f"Codex image attachment not found: {image_path}")
-    instructions_root = _agent_instructions_root()
-    cli_path = _codex_cli_path(instructions_root)
-    codex_home = _codex_membership_home(instructions_root)
-    env = _codex_membership_env(codex_home)
-    _verify_codex_membership(cli_path, env)
-    with tempfile.TemporaryDirectory(prefix="codex-llm-") as temp_dir:
-        argv = _build_codex_argv(
-            cli_path,
-            model=model,
-            working_directory=Path(temp_dir),
-            enable_web=enable_web,
-        )
-        argv = _with_codex_images(argv, image_paths)
-        try:
-            completed = subprocess.run(
-                argv,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=True,
-                timeout=timeout_seconds,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Codex membership call timed out") from None
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"Codex membership call exited with status {exc.returncode}"
-            ) from None
-        except OSError:
-            raise RuntimeError("Codex membership call could not start") from None
-    return _parse_codex_events(completed.stdout)
 
 
 def _agent_instructions_root() -> Path:
@@ -802,14 +739,14 @@ def _agent_instructions_root() -> Path:
 
     candidates = (Path(__file__).resolve().parents[3] / "agent-instructions",)
     for candidate in candidates:
-        if (candidate / "snippets" / "codex_cli.py").is_file():
+        if (candidate / "snippets" / "llm_policy.py").is_file():
             return candidate
     raise FileNotFoundError(
         "agent-instructions root not found; set " + AGENT_INSTRUCTIONS_ROOT_ENV_VAR
     )
 
 
-def _subscription_backends(*, judge: bool = False) -> tuple[str, ...]:
+def _load_llm_policy_module() -> Any:
     module_name = "_angel_memos_llm_policy"
     existing = sys.modules.get(module_name)
     if existing is None:
@@ -821,151 +758,39 @@ def _subscription_backends(*, judge: bool = False) -> tuple[str, ...]:
         sys.modules[module_name] = loaded
         spec.loader.exec_module(loaded)
         existing = loaded
-    resolver = getattr(existing, "subscription_route", None)
-    if not callable(resolver):
+    return existing
+
+
+def subscription_backends() -> tuple[str, ...]:
+    """Return the fleet subscription CLI order (used by interactive launchers)."""
+    policy_mod = _load_llm_policy_module()
+    sub_fn = getattr(policy_mod, "subscription_route", None)
+    if not callable(sub_fn):
         raise RuntimeError("shared fleet LLM policy has an invalid interface")
-    if judge:
-        workload_class = getattr(existing, "WorkloadClass", None)
-        if workload_class is None:
-            raise RuntimeError("shared fleet LLM policy has no workload-class contract")
-        # The dynamic equivalent of WorkloadClass.JUDGE keeps this adapter decoupled
-        # from the shared module's import path while retaining its typed contract.
-        route = resolver(
-            workload_class.JUDGE,
-            explicit_judge_route=JUDGE_SUBSCRIPTION_ROUTE,
-        )
-    else:
-        route = resolver()
-    return tuple(getattr(backend, "value", str(backend)) for backend in route)
+    return tuple(
+        getattr(backend, "value", str(backend)) for backend in cast("tuple[object, ...]", sub_fn())
+    )
+
+
+def _fleet_provider_order() -> tuple[str, ...]:
+    """Resolve fleet provider preference (`gemini > claude`) and subscription chain."""
+    policy_mod = _load_llm_policy_module()
+    preferred_fn = getattr(policy_mod, "preferred_provider_order", None)
+    if not callable(preferred_fn):
+        raise RuntimeError("shared fleet LLM policy has an invalid interface")
+    preferred = tuple(str(p) for p in cast("tuple[object, ...]", preferred_fn()))
+    sub_backends = subscription_backends()
+    ordered: list[str] = []
+    for provider in (*preferred, *sub_backends):
+        if provider in {"gemini", "claude"} and provider not in ordered:
+            ordered.append(provider)
+    return tuple(ordered) or ("gemini", "claude")
 
 
 def _backends_for_purpose(purpose: Purpose) -> tuple[str, ...]:
     if purpose in JUDGE_PURPOSES:
-        return _subscription_backends(judge=True)
-    return _subscription_backends()
-
-
-def _codex_cli_path(instructions_root: Path) -> Path:
-    bin_dir = instructions_root / ".tools" / "node_modules" / ".bin"
-    for name in ("codex.cmd", "codex"):
-        candidate = bin_dir / name
-        if candidate.is_file():
-            return candidate
-    # Return the platform-native expected path so the existing setup check
-    # emits the stable "not installed" error without guessing another home.
-    return bin_dir / ("codex.cmd" if os.name == "nt" else "codex")
-
-
-def _codex_membership_home(instructions_root: Path) -> Path:
-    return instructions_root / ".codex-membership"
-
-
-def _codex_membership_env(codex_home: Path) -> dict[str, str]:
-    env = dict(os.environ)
-    env.pop("OPENAI_API_KEY", None)
-    env.pop("CODEX_API_KEY", None)
-    env["CODEX_HOME"] = str(codex_home)
-    env["NO_COLOR"] = "1"
-    return env
-
-
-def _verify_codex_membership(cli_path: Path, env: dict[str, str]) -> None:
-    if not cli_path.is_file():
-        raise RuntimeError("managed Codex CLI is not installed")
-    try:
-        status = subprocess.run(
-            [str(cli_path), "login", "status"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=30,
-            env=env,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        raise RuntimeError("Codex membership authentication could not be verified") from None
-    output = f"{status.stdout}\n{status.stderr}"
-    if status.returncode != 0 or "Logged in using ChatGPT" not in output:
-        raise RuntimeError("dedicated Codex home is not signed in with ChatGPT")
-
-
-def _build_codex_argv(
-    cli_path: Path,
-    *,
-    model: str,
-    working_directory: Path,
-    enable_web: bool,
-) -> list[str]:
-    if not model.startswith("gpt-"):
-        raise ValueError("Codex membership transport accepts only GPT model IDs")
-    return [
-        str(cli_path),
-        "exec",
-        "--model",
-        model,
-        "--sandbox",
-        "read-only",
-        "--ephemeral",
-        "--ignore-rules",
-        "--skip-git-repo-check",
-        "--color",
-        "never",
-        "--json",
-        "--disable",
-        "shell_tool",
-        "--disable",
-        "shell_snapshot",
-        "--disable",
-        "apps",
-        "--disable",
-        "hooks",
-        "--disable",
-        "multi_agent",
-        "--disable",
-        "remote_plugin",
-        "--config",
-        f'web_search="{"live" if enable_web else "disabled"}"',
-        "--config",
-        'model_reasoning_effort="medium"',
-        "--cd",
-        str(working_directory),
-        "-",
-    ]
-
-
-def _parse_codex_events(stdout: str) -> _CodexResultValue:
-    final_text: str | None = None
-    final_usage: _CodexUsageValue | None = None
-    if not stdout.strip():
-        raise RuntimeError("Codex returned an empty event stream")
-    for raw_line in stdout.splitlines():
-        if not raw_line.strip():
-            continue
-        try:
-            event = _CodexEventValue.model_validate_json(raw_line)
-        except ValidationError:
-            raise RuntimeError("Codex returned an invalid event stream") from None
-        if event.type == "item.completed" and event.item is not None:
-            if event.item.type == "agent_message" and event.item.text:
-                final_text = event.item.text.strip()
-        elif event.type == "turn.completed" and event.usage is not None:
-            final_usage = event.usage
-    if not final_text:
-        raise RuntimeError("Codex did not return a final agent message")
-    if final_usage is None:
-        raise RuntimeError("Codex did not return token usage")
-    return _CodexResultValue(text=final_text, usage=final_usage)
-
-
-def _with_codex_images(argv: list[str], image_paths: list[Path]) -> list[str]:
-    if not argv or argv[-1] != "-":
-        raise ValueError("Codex exec argv must end with the stdin prompt marker")
-    with_images = list(argv[:-1])
-    for image_path in image_paths:
-        with_images.extend(["--image", str(image_path)])
-    with_images.append("-")
-    return with_images
+        return JUDGE_ROUTE
+    return _fleet_provider_order()
 
 
 def _ledger_entry(
@@ -982,9 +807,18 @@ def _ledger_entry(
     error_type: str | None,
 ) -> _LedgerEntry:
     input_tokens = result.input_tokens if result else _estimate_tokens(prompt)
+    cached_tokens = result.cached_input_tokens if result else 0
     output_tokens = result.output_tokens if result else 0
-    prices = _PUBLIC_PRICES_USD_PER_MTOK[model]
-    cost = (input_tokens / 1_000_000) * prices[0] + (output_tokens / 1_000_000) * prices[1]
+    reasoning_tokens = result.reasoning_output_tokens if result else 0
+    prices = _PUBLIC_PRICES_USD_PER_MTOK.get(model, (3.0, 15.0))
+    uncached_input = max(0, input_tokens - cached_tokens)
+    cached_rate = prices[0] * 0.05 if model.startswith("gemini-4-") else prices[0] * 0.10
+    billable_output = output_tokens + reasoning_tokens
+    cost = (
+        (uncached_input / 1_000_000) * prices[0]
+        + (cached_tokens / 1_000_000) * cached_rate
+        + (billable_output / 1_000_000) * prices[1]
+    )
     return _LedgerEntry(
         run_id=run_id,
         purpose=purpose.value,
@@ -993,9 +827,9 @@ def _ledger_entry(
         provider=provider,
         transport=transport,
         input_tokens=input_tokens,
-        cached_input_tokens=result.cached_input_tokens if result else 0,
+        cached_input_tokens=cached_tokens,
         output_tokens=output_tokens,
-        reasoning_output_tokens=result.reasoning_output_tokens if result else 0,
+        reasoning_output_tokens=reasoning_tokens,
         cost_estimate_usd=cost,
         elapsed_ms=elapsed_ms,
         success=result is not None,
@@ -1074,4 +908,3 @@ def _image_mime_type(path: Path) -> str:
     if suffix == ".webp":
         return "image/webp"
     raise ValueError(f"unsupported image type: {suffix}")
-

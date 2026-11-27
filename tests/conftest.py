@@ -25,15 +25,19 @@ _SPOTAI_AL_PAGES = 14
 
 
 def _write_blank_pdf(path: Path, pages: int) -> None:
-    """Write a minimal valid `pages`-page PDF (US Letter) using pypdf."""
-    from pypdf import PdfWriter
+    """Write a minimal valid `pages`-page PDF (US Letter) using PyMuPDF."""
+    from typing import Any, cast
 
-    writer = PdfWriter()
-    for _ in range(pages):
-        writer.add_blank_page(width=612, height=792)  # 8.5x11in in points
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as fh:
-        writer.write(fh)
+    import pymupdf
+
+    doc = cast("Any", pymupdf.open())
+    try:
+        for _ in range(pages):
+            doc.new_page(width=612, height=792)  # 8.5x11in in points
+        path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(path))
+    finally:
+        doc.close()
 
 
 @pytest.fixture(scope="session", autouse=True)

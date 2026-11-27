@@ -390,3 +390,58 @@ def test_decorative_pipes_in_prose_are_not_a_table() -> None:
     problems = _validate_long_memo(_memo_md(s7=s7, s8=s8), decision=_arr_decision())
     assert any("Symbotic" in p and "no table row" in p for p in problems)
     assert any("Zero" in p and "no table row" in p for p in problems)
+
+
+def test_long_memo_call_sends_the_section_structure_system_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user prompt defers to 'the section structure in the system prompt',
+    so the LLM boundary must receive a system prompt or every memo fails the
+    nine-section validation."""
+    import angel_memos.memo as memo_mod
+    from angel_memos.materials import FileEntry, Materials
+    from angel_memos.models import AngelListMetadata
+
+    al_pdf = tmp_path / "angellist - Acme.pdf"
+    al_pdf.write_bytes(b"%PDF-1.4")
+    materials = Materials(
+        folder=tmp_path,
+        angellist=FileEntry(path=al_pdf, kind="angellist"),
+        deck=None,
+    )
+    angellist = AngelListMetadata.model_validate(
+        {
+            "company": "Acme",
+            "round_label": "Seed",
+            "stage": "seed",
+            "instrument": "SAFE",
+            "estimated_round_size_usd": 2_000_000.0,
+            "share_class": "SAFE",
+            "pre_money_usd": 18_000_000.0,
+            "allocation_usd": 100_000.0,
+            "estimated_expenses_pct": 0.05,
+            "leads_investment_usd": 10_000.0,
+            "gross_carry_pct": 0.2,
+            "min_investment_usd": 1_000.0,
+            "markets": ["Software"],
+        }
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_call_llm(prompt: str, **kwargs: object) -> str:
+        calls.append(kwargs)
+        return _memo_md(s7="", s8="")
+
+    monkeypatch.setattr(memo_mod, "call_llm", fake_call_llm)
+
+    def fake_rasterize(*_args: object, **_kwargs: object) -> list[Path]:
+        return []
+
+    monkeypatch.setattr(memo_mod, "rasterize_pdf", fake_rasterize)
+
+    memo_md = memo_mod._generate_long_memo(materials, angellist, _decision())
+
+    assert _validate_long_memo(memo_md, decision=_decision()) == []
+    assert len(calls) == 1
+    system_prompt = calls[0].get("system_prompt")
+    assert isinstance(system_prompt, str) and system_prompt.strip()

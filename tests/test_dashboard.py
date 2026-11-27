@@ -158,7 +158,7 @@ def test_list_deals_reports_furthest_stage(tmp_path: Path) -> None:
 def test_decide_launch_command_uses_fleet_backend_and_mentions_company_and_skill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("angel_memos.dashboard._subscription_backends", lambda: ("codex",))
+    monkeypatch.setattr("angel_memos.dashboard.subscription_backends", lambda: ("codex",))
     cmd = decide_launch_command("Acme Corp")
     joined = " ".join(cmd)
     assert "codex" in cmd
