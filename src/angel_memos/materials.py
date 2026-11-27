@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
-from pypdf import PdfReader
 
 from angel_memos.models import AngelListMetadata, DeckContent
+from angel_memos.pdf_utils import read_pdf_text
 
 logger = logging.getLogger(__name__)
 
@@ -148,18 +148,10 @@ def load_materials(folder: Path) -> Materials:
 
 
 def read_text(entry: FileEntry) -> str:
-    """Extract text content. PDFs via pypdf (best-effort — image-only PDFs
-    return empty string; pass to Claude vision instead). Markdown/text files
-    read directly. Other binaries return empty string."""
+    """Extract text content via PyMuPDF (best-effort for PDFs) or direct UTF-8 read."""
     suffix = entry.path.suffix.lower()
     if suffix == ".pdf":
-        reader = PdfReader(str(entry.path))
-        pages: list[str] = []
-        for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                pages.append(extracted)
-        return "\n\n".join(pages)
+        return read_pdf_text(entry.path)
     if suffix in _TEXT_SUFFIXES:
         return entry.path.read_text(encoding="utf-8")
     return ""
